@@ -1242,7 +1242,10 @@ func _build_bottom_bar() -> void:
 	help.pressed.connect(func(): _help_overlay.visible = not _help_overlay.visible)
 	bar.add_child(help)
 
-	var full := _mk_icon_button("⛶", "全螢幕", C_DIM)
+	# 圖示不能亂挑：U+26F6、U+2922、U+29C9 這幾個常見的「全螢幕」符號都不在打包的
+	# 字型裡，網頁版會變成空白方框（桌面版會被系統字型補掉，看不出來）。
+	# 要換圖示先用 tools/check_font.gd 驗過。
+	var full := _mk_icon_button("▣", "全螢幕", C_DIM)
 	full.pressed.connect(func():
 		var w := DisplayServer.window_get_mode()
 		DisplayServer.window_set_mode(

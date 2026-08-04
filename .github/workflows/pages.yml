@@ -41,6 +41,11 @@ jobs:
         # 第一次匯入一定會以非 0 結束（沒有 .godot 快取），這裡不能讓它中斷流程
         run: godot --headless --path . --import || true
 
+      - name: 檢查字型涵蓋所有用到的字元
+        # 網頁版沒有系統字型可以 fallback，缺字直接變空白方框，
+        # 而且在桌面上完全看不出來 ─ 所以擋在匯出前面
+        run: godot --headless --path . --script res://tools/check_font.gd
+
       - name: 匯出 Web
         run: |
           set -euo pipefail

@@ -18,6 +18,13 @@ config/name="Asymmetric Air Combat"
 run/main_scene="res://Main.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
 
+[gui]
+
+; 網頁版沒有系統字型可以 fallback，不打包 CJK 字型的話所有中文都會變空白／豆腐。
+; 桌面版看起來正常只是因為 Godot 會去借系統字型 ─ 那在瀏覽器裡不存在。
+; Noto Sans TC 是 OFL 授權（fonts/OFL.txt），同時涵蓋拉丁字母，整個 UI 共用這一套。
+theme/custom_font="res://fonts/UIFont.tres"
+
 [display]
 
 window/size/viewport_width=1600

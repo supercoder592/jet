@@ -1,0 +1,13 @@
+; 全專案共用的 UI 字型。
+; 主字型 Noto Sans TC 涵蓋中文與拉丁字母，但不含 ☐☑⚡✈✕❗ 這類符號與 emoji，
+; 所以掛兩套 fallback。缺字在桌面上會被系統字型補掉、完全看不出來，
+; 到了網頁版才會變空白 ─ 用 tools/check_font.gd 檢查，不要靠眼睛。
+[gd_resource type="FontVariation" load_steps=4 format=3]
+
+[ext_resource type="FontFile" path="res://fonts/NotoSansTC-VF.ttf" id="1_main"]
+[ext_resource type="FontFile" path="res://fonts/NotoSansSymbols2-Regular.ttf" id="2_sym"]
+[ext_resource type="FontFile" path="res://fonts/NotoEmoji-VF.ttf" id="3_emoji"]
+
+[resource]
+fallbacks = Array[Font]([ExtResource("2_sym"), ExtResource("3_emoji")])
+base_font = ExtResource("1_main")

@@ -303,6 +303,13 @@ python -m http.server 8123 --directory build\web    # 本機先試開
 推上 GitHub 後，`.github/workflows/pages.yml` 會自動下載 Godot 4.7、匯入、匯出並發布到 Pages。
 倉庫 **Settings → Pages → Source 選 GitHub Actions** 之後，每次推 `main` 就會更新。
 
+- **字型一定要打包**。桌面版的中文看起來正常，是因為 Godot 會去借系統字型；
+  瀏覽器裡沒有系統字型可以借，**沒打包 CJK 字型的話網頁版所有中文都會變空白方框**。
+  `fonts/UIFont.tres` 是全專案共用的字型（`project.godot` 的 `gui/theme/custom_font`）：
+  主字型 Noto Sans TC，另外掛 Noto Sans Symbols 2 與 Noto Emoji 兩套 fallback ─
+  單靠 Noto Sans TC 會缺 `☐☑⚡✈✔❗` 與 emoji 共 14 個字元。全部都是 OFL 授權。
+  用 `godot --headless --path . --script res://tools/check_font.gd` 檢查覆蓋率，
+  它會掃過所有 `.gd` 裡出現的非 ASCII 字元逐一比對，CI 也會擋。**不要用眼睛看**。
 - **Thread Support 一定要關**。Godot 4.3+ 關掉執行緒就不需要 `SharedArrayBuffer`，
   也就不需要 COOP/COEP 標頭 ─ GitHub Pages 無法自訂標頭，這是唯一可行的路線
   （另一條路是掛 `coi-serviceworker` shim）。
