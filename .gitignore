@@ -1,0 +1,14 @@
+# Godot 匯入快取（CI 會自己重建）
+.godot/
+
+# 匯出產物
+build/
+export_presets.cfg.local
+
+# 測試工具的暫存輸出（log、截圖、各實例的 user:// ）
+tools/.smoke/
+tools/.lane/
+tools/.play*/
+
+# Node
+node_modules/

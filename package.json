@@ -1,0 +1,16 @@
+{
+  "name": "aircombat-signaling",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Asymmetric Air Combat 的 WebRTC 信令伺服器（只做房間配對與 SDP/ICE 轉發）",
+  "main": "signaling_server.js",
+  "scripts": {
+    "start": "node signaling_server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.2"
+  }
+}

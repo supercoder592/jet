@@ -1,0 +1,22 @@
+# Render Blueprint ─ WebRTC 信令伺服器
+#
+# 用法：Render → New → Blueprint → 連上這個倉庫，它會讀這個檔自動建服務。
+# 部署完會拿到 https://<服務名>.onrender.com，信令位址就是把 https 換成 wss：
+#
+#   https://<帳號>.github.io/<倉庫名>/?signal=wss://<服務名>.onrender.com
+#
+# 注意：free 方案在閒置一段時間後會休眠，第一個連線可能要等 ~50 秒把它叫醒。
+# 房主按下 HOST 之後若卡在「連線信令伺服器…」，多半就是在等冷啟動。
+services:
+  - type: web
+    name: aircombat-signaling
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    # 伺服器在 / 會回一段純文字，Render 用它判斷服務活著
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
