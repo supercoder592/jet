@@ -1,0 +1,38 @@
+Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org
+OpenGL API 3.3.0 - Build 32.0.101.7076 - Compatibility - Using Device: Intel - Intel(R) Iris(R) Xe Graphics
+
+[PLAY]    0.0s  訪客登入完成，陣營＝防守方
+[PLAY]    0.1s  鎖定地圖：平原
+[BOT] 進攻方 ATTACK 補齊 5 架 AI（真人 0 名）
+[BOT] 防守方 DEFEND 補齊 4 架 AI（真人 1 名）
+[PLAY]    1.6s  單人作戰已開局：地圖 平原 / 天氣 0 / 時段 0
+[PLAY]    1.8s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch5/01-brief.png
+[PLAY]   27.5s  簡報結束，進入部署
+[PLAY]   27.7s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch5/02-deploy.png
+[PLAY]   57.6s  部署結束，戰鬥開始
+[PLAY]   57.6s  已登上 戰鬥機 Fighter（第 1 次出擊）
+[PLAY]   57.6s  自動駕駛接手
+[PLAY]   57.8s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch5/03-takeoff.png
+[PLAY]   81.3s  陣亡（敵機 BOT-ATK-3）
+[PLAY]   81.3s  已登上 戰鬥機 Fighter（第 2 次出擊）
+[PLAY]   81.3s  自動駕駛接手
+[PLAY]   96.6s  陣亡（敵機 BOT-ATK-5）
+[PLAY]   96.6s  已登上 戰鬥機 Fighter（第 3 次出擊）
+[PLAY]   96.6s  自動駕駛接手
+[PLAY]  117.7s  t=1:00  自機HP=105 飛彈存量=0  擊墜=2 陣亡=2  累計射出飛彈=11  核設施HP=1200  跑道HP=420
+[PLAY]  118.0s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch5/04-t01.png
+[PLAY]  138.8s  陣亡（敵機 BOT-ATK-5）
+[PLAY]  138.8s  已登上 戰鬥機 Fighter（第 4 次出擊）
+[PLAY]  138.8s  自動駕駛接手
+[PLAY]  150.3s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch5/05-end.png
+[PLAY]  150.3s  ──────── 戰果 ────────
+[PLAY]  150.3s  結束時比賽時間 92 秒
+[PLAY]  150.3s  勝方：防守方（核設施撐過 10 分鐘）
+[PLAY]  150.3s  我方結果：勝利
+[PLAY]  150.3s  擊墜 4 ／ 陣亡 3（players 計數器）
+[PLAY]  150.3s  出擊 4 次：自己摔 0 ／ 被擊落 3
+[PLAY]  150.3s  整局射出副武裝 12 發
+[PLAY]  150.3s  我方死因：敵機 BOT-ATK-3×1, 敵機 BOT-ATK-5×2
+[PLAY]  150.3s  全場自摔統計（含 AI）：無
+[PLAY]  150.3s  核設施 HP 1200 ／ 跑道 HP 420
+[PLAY]  150.3s  RESULT WIN

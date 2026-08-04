@@ -123,6 +123,7 @@ var _city = null                    # MapCity.gd：都市（高樓林立）
 var _ground = null                  # GroundForces.gd：陸軍（高射砲／防空車／補給車隊／地勤）
 var _fleet = null                   # EscortFleet.gd：護航艦隊
 var _mouse = null                   # FlightHud.gd：飛行視覺回饋（滾轉尺／速度線／鎖定環）
+var _touch = null                   # TouchControls.gd：手機觸控操控層（沒有觸控螢幕就是 null）
 
 # 萊特兄弟事件
 var wright_left: float = 0.0
@@ -291,6 +292,17 @@ func _has_net() -> bool:
 
 func _local_id() -> int:
 	return _mg().my_id()
+
+
+## 本機玩家現在是「走在甲板／停機坪上」還是「在機上」。
+## 觸控層要靠它決定該顯示登機鈕還是整組飛行操控。
+func local_on_foot() -> bool:
+	var id := _local_id()
+	return pilots.has(id) and not aircraft.has(id)
+
+
+func local_is_defender() -> bool:
+	return _mg().my_team() == MainGame.TEAM_DEFENDER
 
 
 #══════════════════════════════════════════════════════════════════════════════
@@ -2303,6 +2315,15 @@ func _build_hud() -> void:
 	_mouse.setup()
 	_mouse.visible = false
 
+	# 手機／平板的觸控操控層。桌面沒有觸控螢幕就根本不會建立，
+	# 想在電腦上調版面或截圖的話設環境變數 FORCE_TOUCH=1。
+	var touch_script := load("res://TouchControls.gd")
+	if touch_script.should_enable():
+		_touch = touch_script.new()
+		_touch.name = "TouchControls"
+		root.add_child(_touch)
+		_touch.setup(self)
+
 	# 練習場的逐步提示
 	_lbl_tutorial = _hud_label("", 19, Color(0.55, 1.00, 0.85))
 	_lbl_tutorial.set_anchors_preset(Control.PRESET_CENTER_TOP)
@@ -2328,6 +2349,11 @@ func _build_hud() -> void:
 	_lbl_help.set_anchors_preset(Control.PRESET_TOP_LEFT)
 	_lbl_help.offset_left = 18; _lbl_help.offset_top = 14
 	root.add_child(_lbl_help)
+
+	# 一定要等整個 HUD 都建好才調整：_lbl_help / _lbl_vitals 都是在觸控層之後才生出來的，
+	# 提早呼叫的話它們還是 null，設定會靜悄悄失效。
+	if _touch != null:
+		_apply_mobile_hud()
 
 
 #══════════════════════════════════════════════════════════════════════════════
@@ -2401,6 +2427,29 @@ class TargetBoxes extends Control:
 	func _draw() -> void:
 		if world != null:
 			world.draw_target_boxes(self)
+
+
+## 觸控模式的 HUD 讓位。三個地方非讓不可：
+##   ‧ 左上角那段「W/S 俯仰　A/D 轉向…」全是鍵盤按鍵，手機上完全沒有意義
+##   ‧ 聊天面板佔滿整個左下角，正好是搖桿要放的位置（手機也打不了字）
+##   ‧ 速度／高度／彈藥讀數在右下，剛好被武器鈕壓住
+func _apply_mobile_hud() -> void:
+	if _lbl_help != null:
+		# 清成空字串而不是只設 visible ─ cli_begin_combat() 之後還會把它設回 visible
+		_lbl_help.text = ""
+	if _lbl_vitals != null:
+		_lbl_vitals.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+		_lbl_vitals.offset_left = -340; _lbl_vitals.offset_top = 120
+		_lbl_vitals.offset_right = -18; _lbl_vitals.offset_bottom = 290
+	# 聊天面板本來在左下角，正好是搖桿的位置。不是把它藏起來 ─ 隊友的訊息、
+	# 擊墜播報、目標提示全都走這個面板，手機上照樣要看得到 ─ 而是搬到左上角
+	# 那塊被鍵盤說明空出來的位置，並縮小一點。
+	var mg := _mg()
+	if mg != null and mg._chat_panel != null:
+		var p: Control = mg._chat_panel
+		p.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		p.offset_left = 14; p.offset_top = 8
+		p.offset_right = 486; p.offset_bottom = 214
 
 
 func _build_hud_overlay(root: Control) -> void:

@@ -1,0 +1,26 @@
+Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org
+
+[PLAY]    0.0s  訪客登入完成，陣營＝防守方
+[PLAY]    0.0s  鎖定地圖：平原
+[BOT] 進攻方 ATTACK 補齊 5 架 AI（真人 0 名）
+[BOT] 防守方 DEFEND 補齊 4 架 AI（真人 1 名）
+[PLAY]    1.6s  單人作戰已開局：地圖 平原 / 天氣 1 / 時段 0
+[PLAY]   27.6s  簡報結束，進入部署
+[PLAY]   57.7s  部署結束，戰鬥開始
+[PLAY]   57.7s  已登上 戰鬥機 Fighter（第 1 次出擊）
+[PLAY]   57.7s  自動駕駛接手
+[PLAY]  111.0s  陣亡（敵機 BOT-ATK-5）
+[PLAY]  111.1s  已登上 戰鬥機 Fighter（第 2 次出擊）
+[PLAY]  111.1s  自動駕駛接手
+[PLAY]  117.7s  t=1:00  自機HP=110 飛彈存量=5  擊墜=0 陣亡=1  累計射出飛彈=3  核設施HP=1200  跑道HP=420
+[PLAY]  150.0s  ──────── 戰果 ────────
+[PLAY]  150.0s  結束時比賽時間 92 秒
+[PLAY]  150.0s  勝方：防守方（核設施撐過 10 分鐘）
+[PLAY]  150.0s  我方結果：勝利
+[PLAY]  150.0s  擊墜 1 ／ 陣亡 1（players 計數器）
+[PLAY]  150.0s  出擊 2 次：自己摔 0 ／ 被擊落 1
+[PLAY]  150.0s  整局射出副武裝 8 發
+[PLAY]  150.0s  我方死因：敵機 BOT-ATK-5×1
+[PLAY]  150.0s  全場自摔統計（含 AI）：撞毀/截擊機 Interceptor×1
+[PLAY]  150.0s  核設施 HP 1200 ／ 跑道 HP 420
+[PLAY]  150.0s  RESULT WIN
