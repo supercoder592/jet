@@ -45,8 +45,11 @@ const BUTTONS := [
 	{ "id": "ac_boost",       "pos": Vector2(1286, 546), "r": 50.0, "label": "後燃",   "col": Color(1.00, 0.80, 0.30), "hold": true },
 	{ "id": "ac_flare",       "pos": Vector2(1440, 424), "r": 46.0, "label": "干擾",   "col": Color(0.75, 0.85, 1.00), "hold": false },
 	{ "id": "ac_view",        "pos": Vector2(1288, 408), "r": 40.0, "label": "視角",   "col": Color(0.62, 0.72, 0.88), "hold": false },
+	# 換裝在空中與地面是兩條完全不同的路徑（空中是 ac_wpn_1/2/3，地面是 ac_swap_weapon），
+	# 所以交給 _ui_action() 判斷，並且直接把目前掛的武裝名稱畫在鈕上 ─
+	# 手機沒有鍵盤提示，不顯示名稱的話根本不知道現在掛什麼。
 	# 這兩個往內縮：手機有圓角與瀏覽器邊界，貼著右緣的鈕按不到
-	{ "id": "ac_swap_weapon", "pos": Vector2(1532, 474), "r": 40.0, "label": "換裝",   "col": Color(0.70, 0.80, 0.95), "hold": false },
+	{ "id": "ui_wpn",         "pos": Vector2(1532, 474), "r": 48.0, "label": "換裝",   "col": Color(0.70, 0.80, 0.95), "hold": false, "dyn": "weapon" },
 	{ "id": "ac_deploy",      "pos": Vector2(1516, 334), "r": 40.0, "label": "防空",   "col": Color(0.45, 0.85, 1.00), "hold": false },
 	{ "id": "ac_thr_up",      "pos": Vector2(86, 366),   "r": 46.0, "label": "油門＋", "col": Color(0.55, 0.95, 0.70), "hold": true },
 	{ "id": "ac_thr_down",    "pos": Vector2(86, 470),   "r": 46.0, "label": "油門－", "col": Color(0.55, 0.95, 0.70), "hold": true },
@@ -104,6 +107,7 @@ func setup(w) -> void:
 
 
 var _was_on_foot: bool = false
+var _last_wpn: String = ""
 
 
 ## 只在戰鬥階段出現。部署階段要用「點地面放防空炮」，簡報階段要點著推進對話 ─
@@ -123,6 +127,11 @@ func _process(_delta: float) -> void:
 	if foot != _was_on_foot:
 		_was_on_foot = foot
 		release_all()
+	# 換裝鈕上畫的是武裝名稱，換了就要重畫
+	var wl := _weapon_label()
+	if wl != _last_wpn:
+		_last_wpn = wl
+		queue_redraw()
 
 
 #══════════════════════════════════════════════════════════════════════════════
@@ -262,6 +271,19 @@ func _ui_action(id: String) -> void:
 	if id == "ui_chat":
 		mg._open_chat_input()
 		return
+	if id == "ui_wpn":
+		var me = world.aircraft.get(mg.my_id())
+		if me == null:
+			# 還走在甲板上：沿用既有的地面循環（_update_on_foot 會處理，
+			# 而且它只在站到展示機旁邊時才有效，跟鍵盤 Q 完全一樣）
+			Input.action_press("ac_swap_weapon", 1.0)
+			_release_next_frame("ac_swap_weapon")
+			return
+		# 空中：鍵盤是 1/2/3 直接指定，觸控就循環到下一種
+		var allowed: Array = MainGame.VSTATS[me.vtype]["weapons"]
+		var idx: int = allowed.find(me.weapon)
+		world._switch_weapon(me, (idx + 1) % allowed.size())
+		return
 	if id.begins_with("ui_radio_"):
 		mg.send_radio(int(id.substr("ui_radio_".length())))
 
@@ -290,6 +312,8 @@ func _btn_enabled(b: Dictionary) -> bool:
 	match id:
 		"ac_board":
 			return on_foot                      # 只有走在甲板上時才需要登機鈕
+		"ui_wpn":
+			return true                          # 換裝在地面（登機前選炸彈）與空中都要能按
 		"ac_deploy":
 			return not on_foot and world.local_is_defender()
 		_:
@@ -307,7 +331,27 @@ func _draw() -> void:
 	for b in _active_buttons():
 		var id := String(b["id"])
 		var held: bool = _pressed.has(id) or (id == "ui_comms" and _comms_open)
-		_draw_button(b["pos"], float(b["r"]), String(b["label"]), b["col"], held)
+		var label := String(b["label"])
+		if b.get("dyn", "") == "weapon":
+			label = _weapon_label()
+		_draw_button(b["pos"], float(b["r"]), label, b["col"], held)
+
+
+## 目前掛載的副武裝名稱，直接畫在換裝鈕上
+func _weapon_label() -> String:
+	var mg = world._mg() if world != null else null
+	if mg == null:
+		return "換裝"
+	var id: int = mg.my_id()
+	var w := -1
+	var me = world.aircraft.get(id)
+	if me != null:
+		w = int(me.weapon)
+	elif mg.players.has(id):
+		w = int(mg.players[id].get("weapon", -1))
+	if w < 0 or not MainGame.WEAPONS.has(w):
+		return "換裝"
+	return String(MainGame.WEAPONS[w]["name"])
 
 
 func _draw_stick() -> void:

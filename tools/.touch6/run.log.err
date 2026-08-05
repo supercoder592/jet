@@ -1,0 +1,5 @@
+ERROR: The InputMap action "ui_wpn" doesn't exist. Did you mean "ac_wpn_1"?
+   at: action_release (core/input/input.cpp:1429)
+   GDScript backtrace (most recent call first):
+       [0] release_all (res://TouchControls.gd:299)
+       [1] _process (res://TouchControls.gd:122)

@@ -4583,6 +4583,12 @@ func cli_end_match(team: int, reason: String) -> void:
 ## 否則調高難度反而會讓自己的僚機也變強，失去意義。連線對戰一律普通。
 ## 自動駕駛（專屬外掛）用的王牌數值：比任何難度的 AI 都強一截。
 ## 從更大的角度就敢開火、射程更遠、反應幾乎即時、還會主動用後燃器追擊。
+## 交戰半徑。進攻方要推進目標，纏鬥半徑刻意小很多；防守方負責攔截，維持原本的 520。
+const ATTACKER_ENGAGE := 240.0
+const DEFENDER_ENGAGE := 520.0
+## 進攻方切進 STRIKE 之後至少咬住幾秒不被拉回纏鬥
+const STRIKE_LOCK_TIME := 9.0
+
 const ACE_PILOT := {
 	"name": "自動駕駛", "en": "AUTOPILOT",
 	"aim": 0.780, "range": 520.0, "dmg": 1.60, "react": 0.22, "flare": 0.030,
@@ -4619,10 +4625,20 @@ func _ai_think(a: Aircraft, delta: float) -> void:
 			if ally == null or not ally.alive or a.ai_support_left <= 0.0:
 				a.ai_state = "PATROL"
 		if a.ai_state != "SUPPORT":
-			var enemy := _nearest_enemy(a, 520.0)
+			# 交戰半徑分陣營：防守方的任務就是攔截，看到就上；
+			# 進攻方半徑刻意壓到 240 m，只有真的被咬住才回頭纏鬥。
+			# 舊版兩邊都是 520 m ─ 防守方五架就繞著自己基地飛，進攻方一飛向目標
+			# 就一定有人在 520 m 內，於是非轟炸機永遠切不進 STRIKE，
+			# 實測十分鐘核設施只掉 14/1200 血，進攻方根本不可能贏。
+			var engage: float = ATTACKER_ENGAGE if a.team == MainGame.TEAM_ATTACKER else DEFENDER_ENGAGE
+			var enemy := _nearest_enemy(a, engage)
 			# 圍毆上限：同一個目標最多兩架咬，其他人去做別的事。
 			# 沒有這個限制，開場三架敵機會全部撲向玩家。
 			if enemy != null and _gang_count(enemy, a) >= MainGame.AI_MAX_GANG:
+				enemy = null
+			# STRIKE 黏性：已經朝目標飛的進攻方，中途遇敵不改變主意，
+			# 否則會在「纏鬥 ↔ 對地」之間來回抖動，兩件事都做不完。
+			if a.ai_strike_lock > 0.0 and a.team == MainGame.TEAM_ATTACKER:
 				enemy = null
 			if enemy != null and a.vtype != MainGame.VType.BOMBER:
 				if a.ai_target != enemy:
@@ -4630,9 +4646,12 @@ func _ai_think(a: Aircraft, delta: float) -> void:
 				a.ai_target = enemy
 				a.ai_state = "ATTACK"
 			elif a.ai_state != "CAPTURE":
+				if a.ai_state != "STRIKE":
+					a.ai_strike_lock = STRIKE_LOCK_TIME
 				a.ai_state = "STRIKE"
 	a.ai_support_left = maxf(0.0, a.ai_support_left - delta)
 	a.ai_spot = maxf(0.0, a.ai_spot - delta)
+	a.ai_strike_lock = maxf(0.0, a.ai_strike_lock - delta)
 
 	# ── 決定目標點 ──
 	var goal := Vector3.ZERO
@@ -4767,6 +4786,10 @@ func _ai_think(a: Aircraft, delta: float) -> void:
 ## 轟炸機是唯一能有效拆設施的機種，直接去核設施；
 ## 其他機種先癱瘓跑道，等核設施掉到七成以下再全員集火。
 func _ai_hits_nuke(a: Aircraft) -> bool:
+	# 自動駕駛（外掛）直接衝核設施：玩家開外掛就是想贏，
+	# 讓它跟一般 AI 一樣先去炸跑道等於白開。
+	if a.is_local and autopilot:
+		return true
 	if a.vtype == MainGame.VType.BOMBER:
 		return true
 	if runway_down:
@@ -5181,6 +5204,7 @@ class Aircraft extends CharacterBody3D:
 	var ai_timer: float = 0.0
 	var ai_wp := Vector3.ZERO
 	var ai_spot: float = 0.0        # 剛發現目標後的開火延遲
+	var ai_strike_lock: float = 0.0 # STRIKE 黏性：決定去拆設施後咬住不放的剩餘秒數
 
 	var pivot: Node3D
 	var rotor: Node3D

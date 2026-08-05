@@ -1,0 +1,29 @@
+Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org
+OpenGL API 3.3.0 - Build 32.0.101.7076 - Compatibility - Using Device: Intel - Intel(R) Iris(R) Xe Graphics
+
+[PLAY]    0.2s  訪客登入完成，陣營＝進攻方
+[PLAY]    0.3s  鎖定地圖：平原
+[BOT] 進攻方 ATTACK 補齊 4 架 AI（真人 1 名）
+[BOT] 防守方 DEFEND 補齊 5 架 AI（真人 0 名）
+[PLAY]    3.9s  單人作戰已開局：地圖 平原 / 天氣 1 / 時段 0
+[PLAY]    5.3s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch6/01-brief.png
+[PLAY]   31.9s  簡報結束，進入部署
+[PLAY]   32.5s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch6/02-deploy.png
+[PLAY]   62.6s  部署結束，戰鬥開始
+[PLAY]   62.6s  已登上 戰鬥機 Fighter（第 1 次出擊）
+[PLAY]   62.6s  自動駕駛接手
+[PLAY]   63.1s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch6/03-takeoff.png
+[PLAY]  123.0s  t=1:00  自機HP=58 飛彈存量=0  擊墜=2 陣亡=0  累計射出飛彈=6  核設施HP=1200  跑道HP=420
+[PLAY]  124.0s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch6/04-t01.png
+[PLAY]  150.6s  截圖 → C:\Users\Tin\AirCombatGame\tools\.touch6/05-end.png
+[PLAY]  150.6s  ──────── 戰果 ────────
+[PLAY]  150.6s  結束時比賽時間 86 秒
+[PLAY]  150.6s  勝方：防守方（核設施撐過 10 分鐘）
+[PLAY]  150.6s  我方結果：落敗
+[PLAY]  150.6s  擊墜 2 ／ 陣亡 0（players 計數器）
+[PLAY]  150.6s  出擊 1 次：自己摔 0 ／ 被擊落 0
+[PLAY]  150.6s  整局射出副武裝 6 發
+[PLAY]  150.6s  我方死因：無
+[PLAY]  150.6s  全場自摔統計（含 AI）：無
+[PLAY]  150.6s  核設施 HP 1200 ／ 跑道 HP 420
+[PLAY]  150.6s  RESULT LOSE
