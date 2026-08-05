@@ -7,6 +7,7 @@ export_presets.cfg.local
 
 # 測試工具的暫存輸出（log、截圖、各實例的 user:// ）
 tools/.smoke/
+tools/.websmoke/
 tools/.lane/
 tools/.play*/
 

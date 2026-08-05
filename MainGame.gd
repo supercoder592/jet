@@ -348,15 +348,25 @@ const RADIO_SCOPE := [SCOPE_TEAM, SCOPE_TEAM, SCOPE_TEAM, SCOPE_ALL]
 enum NetMode { ENET, WEBRTC }
 enum Screen { MENU, SOLO, ROOM, SHOP, LOGIN, TUTORIAL }
 
-## 信令伺服器的預設位址（可用附帶的 signaling_server.js 架設）。
-## 部署到 GitHub Pages 之後不需要為了換伺服器重新匯出 ─ 見 signaling_url()。
-const SIGNALING_URL := "ws://127.0.0.1:9080"
+## 信令伺服器的預設位址 ─ render.yaml 在 Render 上建的那台。
+## 這個值必須是正式伺服器而不是 127.0.0.1：網頁版的玩家不會知道要在網址後面加參數，
+## 預設連本機等於「線上對戰按下去永遠轉圈」。想換伺服器不必重新匯出 ─ 見 signaling_url()。
+const SIGNALING_URL := "wss://aircombat-signaling.onrender.com"
 const ICE_CONFIG := {
 	"iceServers": [
 		{ "urls": ["stun:stun.l.google.com:19302"] },
 	]
 }
 const ENET_BASE_PORT := 10000   # ENet 測試模式：埠號 = 10000 + 房號
+
+## Render 的 free 方案閒置後會休眠，第一個連線得等它冷啟動（實測 13 秒，最壞超過 50 秒）。
+## 逾時給得太短的話，玩家看到的會是「連不上」而不是「等一下就好」。
+const SIG_CONNECT_TIMEOUT := 75.0
+## 信令通了之後 P2P 還接不上，多半是 UDP 被擋 ─ 不能無止盡地轉圈
+const RTC_LINK_TIMEOUT := 35.0
+## 房間開著的期間信令連線要一直留著（新玩家靠它進來），
+## 但反向代理會砍掉閒置連線，得定期戳一下
+const SIG_PING_INTERVAL := 20.0
 
 # ─────────────────────────── 執行期狀態 ───────────────────────────
 static var instance: MainGame
@@ -389,6 +399,15 @@ var _ws_open: bool = false
 var _pending_sig: Dictionary = {}
 var _rtc: WebRTCMultiplayerPeer = null
 var _conns: Dictionary = {}      # peer_id -> WebRTCPeerConnection
+var _sig_role_host: bool = false # 這次信令連線是去開房還是去加入
+var _sig_deadline_ms: int = 0    # 信令 WebSocket 要在這之前連上
+var _rtc_deadline_ms: int = 0    # P2P 要在這之前接上；0 = 不計時
+var _sig_next_ping_ms: int = 0
+var _host_code_tries: int = 0    # 房號撞號重抽的次數
+## NETDEBUG=1（網頁版 ?netdebug=1）會把整段交握印出來。
+## P2P 壞掉的時候兩邊各自只看得到自己那一半，沒有這個沒辦法分辨是誰沒回話。
+var _net_debug: bool = false
+var _rtc_state_log_ms: int = 0
 
 # UI 節點參考
 var _ui: CanvasLayer
@@ -465,10 +484,12 @@ func _ready() -> void:
 	add_chat_line("[系統] 歡迎來到 ASYMMETRIC AIR COMBAT。", C_DIM)
 	add_chat_line("[系統] 建立或加入房間後選擇陣營，由房主開始遊戲。", C_DIM)
 
-	# 測試用掛載：只有設了對應的環境變數才會執行，正式遊玩兩者都不會碰到
-	if OS.get_environment("NETSMOKE").strip_edges() != "":
+	_net_debug = test_flag("NETDEBUG") != ""
+
+	# 測試用掛載：只有設了對應的開關才會執行，正式遊玩兩者都不會碰到
+	if test_flag("NETSMOKE") != "":
 		add_child(load("res://NetSmoke.gd").new())      # 連線煙霧測試
-	if OS.get_environment("AUTOPLAY").strip_edges() != "":
+	if test_flag("AUTOPLAY") != "":
 		add_child(load("res://AutoPlay.gd").new())      # 自動打一局單人作戰
 
 
@@ -1224,7 +1245,15 @@ func _build_screen_room(parent: Control) -> Control:
 	_start_btn.pressed.connect(start_match)
 	col.add_child(_start_btn)
 
-	col.add_child(_mk_back_button())
+	# 這一頁的返回鍵不能只是換畫面：房間還開著、信令 WebSocket 還連著、
+	# has_net() 仍是 true ─ 再進來按 HOST 只會拿到「已在連線中，請先重新啟動」。
+	var back := _mk_button("◀  返回主選單", C_DIM)
+	back.pressed.connect(func():
+		if not in_match:
+			leave_net()
+			_set_status("尚未連線。")
+		_show_screen(Screen.MENU))
+	col.add_child(back)
 	return scr
 
 
@@ -1831,6 +1860,17 @@ func has_net() -> bool:
 	return p.get_connection_status() != MultiplayerPeer.CONNECTION_DISCONNECTED
 
 
+## 「真的接上了」，而不是「正在接」。
+## has_net() 只排除 DISCONNECTED，所以 WebRTC 一開始交握它就回 true ─
+## 拿它當「已連線」會得到兩個錯覺：RPC 明明還送不出去卻以為連上了，
+## 而且 P2P 逾時的看門狗會被這個假的 true 關掉，永遠不會告訴玩家打不通。
+func net_connected() -> bool:
+	var p := multiplayer.multiplayer_peer
+	if p == null or p is OfflineMultiplayerPeer:
+		return false
+	return p.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+
+
 func host_game() -> void:
 	if has_net():
 		_set_status("已在連線中，請先重新啟動。")
@@ -1841,9 +1881,14 @@ func host_game() -> void:
 	if _pass_edit:
 		room_pass = _pass_edit.text.strip_edges()
 	is_host = true
+	_host_code_tries = 0
 
 	if net_mode == NetMode.WEBRTC:
+		# WebRTC 的房間要等信令伺服器回 welcome 才算數 ─ 這時候還不能宣稱房號有效，
+		# 而且房號可能因為撞號被換掉。真正的房號由 _on_became_host() 填。
+		_room_lbl.text = "開房中…"
 		_sig_connect({ "cmd": "host", "room": room_code })
+		return
 	else:
 		var peer := ENetMultiplayerPeer.new()
 		var err := peer.create_server(_port_from_code(room_code), 16)
@@ -1852,9 +1897,7 @@ func host_game() -> void:
 			is_host = false
 			return
 		multiplayer.multiplayer_peer = peer
-		_on_became_host()
-
-	_room_lbl.text = "房號  %s" % room_code
+		_on_became_host()   # 房號標籤也在這裡填
 
 
 ## code 可以是 4 位數房號，也可以是 主機IP 或 主機IP:埠號（ENet 模式）
@@ -1927,6 +1970,7 @@ func _on_became_host() -> void:
 	players[1] = _new_player_entry(_local_name,
 		int(prev.get("team", TEAM_ATTACKER)), int(prev.get("vtype", VType.FIGHTER)), false)
 	_start_btn.disabled = false
+	_room_lbl.text = "房號  %s" % room_code
 	var pw := "（密碼：%s）" % room_pass if room_pass != "" else "（未設密碼）"
 	_set_status("房間已開啟，把房號 %s %s 給隊友。" % [room_code, pw])
 	add_chat_line("[系統] 房間 %s 建立完成%s，你是房主。" % [room_code, pw], C_DIM)
@@ -1935,8 +1979,10 @@ func _on_became_host() -> void:
 
 
 func _gen_room_code() -> String:
-	# 自動化測試要固定房號，客戶端才知道要連哪個埠
-	var forced := OS.get_environment("NETSMOKE_ROOM").strip_edges()
+	# 自動化測試要固定房號，客戶端才知道要連哪個埠／哪一間房。
+	# 這裡一定要走 test_flag() 而不是 OS.get_environment() ─ 網頁版沒有環境變數，
+	# 讀不到就會改抽隨機房號，客戶端於是連到一間不存在的房。
+	var forced := test_flag("NETSMOKE_ROOM")
 	if forced.length() == 4 and forced.is_valid_int():
 		return forced
 	return "%04d" % (randi() % 9000 + 1000)
@@ -1968,57 +2014,226 @@ func _fix_weapon(id: int) -> void:
 #══════════════════════════════════════════════════════════════════════════════
 #  WebRTC 信令（WebSocket）
 #══════════════════════════════════════════════════════════════════════════════
+## 測試開關：桌面版讀環境變數，網頁版讀同名的網址參數（小寫）。
+##   桌面：NETSMOKE=host NETSMOKE_ROOM=4242
+##   網頁：?netsmoke=host&netsmoke_room=4242
+## 網頁版沒有環境變數可以設，而 WebRTC 那條路**只有網頁版跑得到** ─
+## 沒有這個入口就沒有任何方法自動驗證網頁版的連線對戰。
+func test_flag(key: String) -> String:
+	var v := OS.get_environment(key).strip_edges()
+	if v != "":
+		return v
+	return _web_query(key.to_lower())
+
+
+## 讀網址參數（只有網頁版有）。桌面版一律回空字串。
+func _web_query(key: String) -> String:
+	if not OS.has_feature("web") or not Engine.has_singleton("JavaScriptBridge"):
+		return ""
+	var js := Engine.get_singleton("JavaScriptBridge")
+	var v: Variant = js.eval(
+		"new URLSearchParams(location.search).get('%s') || ''" % key, true)
+	# eval 失敗時回的是 null，str(null) 會變成 "<null>" 這種看起來有值的字串，
+	# 直接拿去當網址就會連到一個不存在的地方，所以要判型別而不是判空。
+	if typeof(v) != TYPE_STRING:
+		return ""
+	return String(v).strip_edges()
+
+
 ## 實際要連的信令位址。優先序：
 ##   1. 網址參數 `?signal=wss://…`  ─ 網頁版換伺服器不必重新匯出，分享網址時就能帶著走
 ##   2. 環境變數 `SIGNALING_URL`    ─ 桌面版與自動化測試用
-##   3. 常數 SIGNALING_URL          ─ 內建預設
+##   3. 常數 SIGNALING_URL          ─ 內建預設（Render 上的正式伺服器）
 ## 網頁是 https 時瀏覽器會擋掉 ws://，所以線上一定要給 wss://。
 func signaling_url() -> String:
-	if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-		var js := Engine.get_singleton("JavaScriptBridge")
-		var q := str(js.eval(
-			"new URLSearchParams(location.search).get('signal') || ''", true)).strip_edges()
-		if q != "":
-			return q
+	var q := _web_query("signal")
+	if q != "":
+		return q
 	var env := OS.get_environment("SIGNALING_URL").strip_edges()
 	if env != "":
 		return env
 	return SIGNALING_URL
 
 
+## 實際要用的 ICE 設定。STUN 應付得了絕大多數家用 NAT；
+## 少數對稱式 NAT（常見於公司網路與部分行動網路）兩邊都打不通，只能靠 TURN 中繼。
+## TURN 要錢又要自己架，所以不內建，改成用網址參數帶進來：
+##   ?turn=turn:host:3478&turnuser=帳號&turnpass=密碼
+func ice_config() -> Dictionary:
+	var turn := _web_query("turn")
+	if turn == "":
+		turn = OS.get_environment("TURN_URL").strip_edges()
+	if turn == "":
+		return ICE_CONFIG
+	var entry := { "urls": [turn] }
+	var u := _web_query("turnuser")
+	var p := _web_query("turnpass")
+	if u == "":
+		u = OS.get_environment("TURN_USER").strip_edges()
+	if p == "":
+		p = OS.get_environment("TURN_PASS").strip_edges()
+	if u != "":
+		entry["username"] = u
+	if p != "":
+		entry["credential"] = p
+	var servers: Array = ICE_CONFIG["iceServers"].duplicate(true)
+	servers.append(entry)
+	return { "iceServers": servers }
+
+
 func _sig_connect(first_msg: Dictionary) -> void:
 	_pending_sig = first_msg
+	_sig_role_host = String(first_msg.get("cmd", "")) == "host"
 	_ws_open = false
 	_conns.clear()
+
 	var url := signaling_url()
+	if not (url.begins_with("ws://") or url.begins_with("wss://")):
+		_net_fail("信令位址格式不正確（必須是 ws:// 或 wss://）：%s" % url)
+		return
+
 	_ws = WebSocketPeer.new()
 	var err := _ws.connect_to_url(url)
 	if err != OK:
-		_set_status("無法連線信令伺服器 %s（錯誤碼 %d）。" % [url, err])
 		_ws = null
+		_net_fail("無法連線信令伺服器 %s（錯誤碼 %d）。" % [url, err])
 		return
+
+	var now := Time.get_ticks_msec()
+	_sig_deadline_ms = now + int(SIG_CONNECT_TIMEOUT * 1000.0)
+	_rtc_deadline_ms = 0
+	_sig_next_ping_ms = 0
 	_set_status("連線信令伺服器 %s …" % url)
+	_join_status("working", "呼叫信令伺服器　CONTACTING",
+		"%s ─ 伺服器閒置後需要喚醒，最久可能要一分鐘。" % url)
 
 
 func _poll_signaling() -> void:
 	if _ws == null:
+		_check_rtc_deadline()
 		return
+
 	_ws.poll()
 	var state := _ws.get_ready_state()
+	var now := Time.get_ticks_msec()
 
 	if state == WebSocketPeer.STATE_OPEN:
 		if not _ws_open:
 			_ws_open = true
 			_sig_send(_pending_sig)
-		while _ws.get_available_packet_count() > 0:
+			_sig_next_ping_ms = now + int(SIG_PING_INTERVAL * 1000.0)
+			_rtc_deadline_ms = now + int(RTC_LINK_TIMEOUT * 1000.0)
+		# 每個 while 迴圈都要重新檢查 _ws：訊息處理到一半可能就走了 _net_fail → leave_net()，
+		# 那裡會把 _ws 設成 null。少了這個判斷，下一圈就是對 null 呼叫方法 ─
+		# 桌面 debug 版只是噴一行腳本錯誤，**網頁 release 版是整個 wasm 當場 crash**
+		#（console 上看到的是 `RuntimeError: null function`，完全看不出跟這裡有關）。
+		while _ws != null and _ws.get_available_packet_count() > 0:
 			var txt := _ws.get_packet().get_string_from_utf8()
 			var data: Variant = JSON.parse_string(txt)
 			if data is Dictionary:
 				_on_sig_message(data)
+		if _ws == null:
+			return
+		if now >= _sig_next_ping_ms:
+			_sig_next_ping_ms = now + int(SIG_PING_INTERVAL * 1000.0)
+			_sig_send({ "cmd": "ping" })
+
+	elif state == WebSocketPeer.STATE_CONNECTING:
+		# 沒有這段，冷啟動中的伺服器與根本不存在的伺服器看起來一模一樣：都是永遠轉圈
+		if now >= _sig_deadline_ms:
+			_ws = null
+			_net_fail("連不上信令伺服器（等了 %d 秒）：%s\n沒有它就配對不起來，單人作戰不受影響。"
+				% [int(SIG_CONNECT_TIMEOUT), signaling_url()])
+
 	elif state == WebSocketPeer.STATE_CLOSED:
-		_set_status("信令連線關閉（code %d）。" % _ws.get_close_code())
+		var code := _ws.get_close_code()
+		var was_open := _ws_open
 		_ws = null
 		_ws_open = false
+		if not was_open:
+			_net_fail("連不上信令伺服器：%s\n沒有它就配對不起來，單人作戰不受影響。" % signaling_url())
+		elif not has_net():
+			_net_fail("信令連線中斷（code %d），P2P 還沒建立起來。" % code)
+		else:
+			# 已經接上 P2P 了：信令只是配對用的，斷掉不影響現在這一局
+			_set_status("信令連線中斷（code %d）─ 目前這局不受影響，但新玩家將無法加入。" % code)
+
+	_check_rtc_deadline()
+
+
+## 信令通了、SDP 也換了，但 P2P 就是接不上 ─ 給它一個終點。
+## 房主是被動等人來連，不設限；只有主動加入的一方需要這條。
+func _check_rtc_deadline() -> void:
+	_log_rtc_states()
+	if _rtc_deadline_ms == 0 or _sig_role_host:
+		return
+	if net_connected():
+		_rtc_deadline_ms = 0
+		return
+	if Time.get_ticks_msec() < _rtc_deadline_ms:
+		return
+	_rtc_deadline_ms = 0
+	_net_fail("P2P 連線建立失敗 ─ 信令通了但打不通對方。\n多半是雙方的 NAT 或防火牆擋掉 UDP，換個網路（例如手機熱點）再試。")
+
+
+## 連線流程失敗的共用出口。
+## 客戶端要讓戰術彈窗停在「失敗」而不是「交握中」；房主則要把半開的房間狀態收乾淨，
+## 否則 is_host 與 multiplayer_peer 都還掛著，下次按 HOST 會被 host_game() 的守衛擋掉。
+func _net_fail(msg: String) -> void:
+	if _sig_role_host:
+		_set_status(msg)
+		add_chat_line("[系統] 開房失敗：%s" % msg, C_DIM)
+	else:
+		_join_fail(msg)   # 它自己會呼叫 _set_status，不要再叫一次否則會印兩行
+	leave_net()
+
+
+## 把所有網路狀態收乾淨：信令 WebSocket、P2P 連線、名單、房號、UI。
+## 少收哪一樣都會留下「看起來還在連線」的殘骸 ─ 最常見的症狀是退出房間後
+## has_net() 仍是 true，再按一次 HOST 只會得到「已在連線中，請先重新啟動」。
+func leave_net() -> void:
+	var keep: Dictionary = players.get(my_id(), {})
+
+	if _ws != null:
+		_ws.close(1000, "leave")
+		_ws = null
+	_ws_open = false
+	_pending_sig = {}
+	_sig_deadline_ms = 0
+	_rtc_deadline_ms = 0
+	_sig_next_ping_ms = 0
+	_host_code_tries = 0
+
+	# 這個函式很常是在 multiplayer 輪詢自己的封包時被呼叫的（被踢、房主斷線），
+	# 當場關掉 peer 等於在迴圈中間抽掉腳下的地板。
+	# 但**狀態**必須當場清乾淨 ─ 呼叫端（UI 與煙霧測試）在斷線的同一幀就會讀 room_code，
+	# 整包延後的話它們讀到的是還沒清掉的舊值。所以：狀態同步清，關 peer 延後。
+	for pid in _conns.keys():
+		var c: WebRTCPeerConnection = _conns[pid]
+		if c != null:
+			c.close.call_deferred()
+	_conns.clear()
+
+	var peer := multiplayer.multiplayer_peer
+	multiplayer.multiplayer_peer = null
+	if peer != null and not (peer is OfflineMultiplayerPeer):
+		peer.close.call_deferred()
+	_rtc = null
+
+	is_host = false
+	room_code = ""
+
+	# 名單回到「只有自己」，主選單才選得動陣營與機種
+	players.clear()
+	players[1] = _new_player_entry(_local_name,
+		int(keep.get("team", TEAM_ATTACKER)), int(keep.get("vtype", VType.FIGHTER)), false)
+
+	if _room_lbl:
+		_room_lbl.text = "尚未開房"
+	if _start_btn:
+		_start_btn.disabled = true
+	_refresh_roster()
+	_refresh_vtype_buttons()
 
 
 func _sig_send(msg: Dictionary) -> void:
@@ -2026,10 +2241,49 @@ func _sig_send(msg: Dictionary) -> void:
 		_ws.send_text(JSON.stringify(msg))
 
 
+func _ndbg(msg: String) -> void:
+	if _net_debug:
+		print("[RTC][%s] %s" % ["HOST" if is_host else "CLI", msg])
+
+
+## WebRTC 交握中的每個階段都印一行。沒有這個，P2P 接不起來的時候
+## 兩邊各自只看得到自己送出去的東西，完全分不出是誰沒回話。
+func _log_rtc_states() -> void:
+	if not _net_debug or _conns.is_empty():
+		return
+	var now := Time.get_ticks_msec()
+	if now < _rtc_state_log_ms:
+		return
+	_rtc_state_log_ms = now + 2000
+	for pid in _conns:
+		var c: WebRTCPeerConnection = _conns[pid]
+		if c == null:
+			continue
+		_ndbg("peer %d  signaling=%d ice=%d gathering=%d  mp_status=%d"
+			% [pid, c.get_signaling_state(), c.get_connection_state(),
+				c.get_gathering_state(),
+				multiplayer.multiplayer_peer.get_connection_status()
+					if multiplayer.multiplayer_peer != null else -1])
+
+
 func _on_sig_message(m: Dictionary) -> void:
+	_ndbg("信令 ← %s %s" % [m.get("cmd", "?"),
+		("from=%s" % m["from"]) if m.has("from") else ""])
 	match String(m.get("cmd", "")):
+		"pong":
+			pass   # keepalive 的回音，收到就代表線還活著
+
 		"error":
-			_set_status("信令錯誤：%s" % m.get("msg", ""))
+			# 房號是隨機抽的，撞號是正常現象，不該讓玩家自己再按一次 HOST
+			if String(m.get("code", "")) == "room_taken" and _sig_role_host and _host_code_tries < 5:
+				_host_code_tries += 1
+				room_code = _gen_room_code()
+				if _room_lbl:
+					_room_lbl.text = "房號  %s" % room_code
+				_set_status("房號被佔用，改用 %s 重新開房…" % room_code)
+				_sig_send({ "cmd": "host", "room": room_code })
+				return
+			_net_fail("信令錯誤：%s" % m.get("msg", m.get("code", "未知錯誤")))
 
 		"welcome":
 			var my_id := int(m["id"])
@@ -2040,7 +2294,7 @@ func _on_sig_message(m: Dictionary) -> void:
 			else:
 				err = _rtc.create_client(my_id)
 			if err != OK:
-				_set_status("WebRTCMultiplayerPeer 初始化失敗（%d）。桌面版需安裝 webrtc GDExtension。" % err)
+				_net_fail("WebRTCMultiplayerPeer 初始化失敗（%d）。桌面版需安裝 webrtc GDExtension，網頁版才有原生支援。" % err)
 				return
 			multiplayer.multiplayer_peer = _rtc
 			if is_host:
@@ -2048,9 +2302,11 @@ func _on_sig_message(m: Dictionary) -> void:
 			else:
 				# 客戶端只需與房主 (id 1) 建立連線
 				var c := _rtc_make_conn(1)
-				if c:
-					c.create_offer()
+				if c == null:
+					return   # _rtc_make_conn 已經走過 _net_fail
+				c.create_offer()
 				_set_status("與房主建立 P2P 連線中…")
+				_join_status("working", "建立 P2P　PEER LINK", "已交換信令，正在打通對點連線…")
 
 		"peer_join":
 			# 房主收到：等待該客戶端送 offer 過來
@@ -2061,7 +2317,10 @@ func _on_sig_message(m: Dictionary) -> void:
 			var pid := int(m["id"])
 			if _conns.has(pid):
 				_conns.erase(pid)
-			if _rtc:
+			# 一定要先問 has_peer()。玩家離開時，P2P 那條路通常會先斷、
+			# WebRTCMultiplayerPeer 自己就把 peer 拿掉了，信令的 peer_left 才姍姍來遲 ─
+			# 這時候再 remove_peer() 一次就會噴 `Condition "!peer_map.has(p_peer_id)" is true`。
+			if _rtc != null and _rtc.has_peer(pid):
 				_rtc.remove_peer(pid)
 
 		"sdp":
@@ -2070,28 +2329,33 @@ func _on_sig_message(m: Dictionary) -> void:
 			if conn == null:
 				conn = _rtc_make_conn(from)
 			if conn:
-				conn.set_remote_description(String(m["type"]), String(m["sdp"]))
+				var e := conn.set_remote_description(String(m["type"]), String(m["sdp"]))
+				_ndbg("set_remote_description(%s) → err=%d" % [m["type"], e])
 
 		"ice":
 			var f := int(m["from"])
 			var cc: WebRTCPeerConnection = _conns.get(f)
 			if cc:
-				cc.add_ice_candidate(String(m["mid"]), int(m["index"]), String(m["name"]))
+				var e2 := cc.add_ice_candidate(String(m["mid"]), int(m["index"]), String(m["name"]))
+				if e2 != OK:
+					_ndbg("add_ice_candidate → err=%d" % e2)
 
 
 func _rtc_make_conn(peer_id: int) -> WebRTCPeerConnection:
 	if _conns.has(peer_id):
 		return _conns[peer_id]
 	var conn := WebRTCPeerConnection.new()
-	if conn.initialize(ICE_CONFIG) != OK:
-		_set_status("WebRTCPeerConnection 無法初始化（桌面版需 webrtc GDExtension）。")
+	if conn.initialize(ice_config()) != OK:
+		_net_fail("WebRTCPeerConnection 無法初始化（桌面版需 webrtc GDExtension，網頁版才有原生支援）。")
 		return null
 	conn.session_description_created.connect(func(type: String, sdp: String):
+		_ndbg("產生 %s，送給 peer %d" % [type, peer_id])
 		conn.set_local_description(type, sdp)
 		_sig_send({ "cmd": "sdp", "to": peer_id, "type": type, "sdp": sdp }))
 	conn.ice_candidate_created.connect(func(mid: String, index: int, cname: String):
 		_sig_send({ "cmd": "ice", "to": peer_id, "mid": mid, "index": index, "name": cname }))
-	_rtc.add_peer(conn, peer_id)
+	var err := _rtc.add_peer(conn, peer_id)
+	_ndbg("建立 peer %d 的連線，add_peer → err=%d" % [peer_id, err])
 	_conns[peer_id] = conn
 	return conn
 
@@ -2123,13 +2387,12 @@ func _on_connected_ok() -> void:
 
 func _on_connection_failed() -> void:
 	_join_fail("連線失敗，請確認房號／位址與伺服器是否正確。")
-	multiplayer.multiplayer_peer = null
+	leave_net()
 
 
 func _on_server_disconnected() -> void:
 	_set_status("與房主斷線。")
-	multiplayer.multiplayer_peer = null
-	room_code = ""
+	leave_net()
 	_return_to_menu()
 
 
@@ -2173,8 +2436,7 @@ func _kick(id: int, pname: String, reason: String) -> void:
 @rpc("authority", "reliable")
 func cli_reject(reason: String) -> void:
 	_join_fail(reason)
-	multiplayer.multiplayer_peer = null
-	room_code = ""
+	leave_net()
 	add_chat_line("[系統] 連線被拒：%s" % reason, Color(1.0, 0.4, 0.4))
 
 

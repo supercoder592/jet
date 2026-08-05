@@ -6,8 +6,12 @@ extends Node
 #  由 MainGame._ready() 在環境變數 NETSMOKE 有值時才掛上，正式遊玩完全不會執行。
 #  兩個 headless 實例各自扮演房主與客戶端，跑完就以 exit code 0 / 1 回報。
 #
+#  網頁版沒有環境變數，改用同名的小寫網址參數，例如
+#    https://…/?netsmoke=host&netsmoke_scenario=link&netsmoke_room=4242
+#  這是驗證 WebRTC 唯一的辦法 ─ 桌面版沒裝 webrtc GDExtension 根本走不到那條路。
+#
 #    NETSMOKE          host | client        本實例的角色
-#    NETSMOKE_SCENARIO happy | badpass | latejoin
+#    NETSMOKE_SCENARIO happy | link | badpass | latejoin
 #    NETSMOKE_ROOM     4 位數房號（房主固定用它開房，客戶端拿它連）
 #    NETSMOKE_PASS     房主設定的房間密碼（空字串＝不設密碼）
 #    NETSMOKE_JOINPASS 客戶端輸入的密碼（badpass 情境故意填錯）
@@ -53,8 +57,13 @@ func _process(_d: float) -> void:
 		_saw_link = true
 
 
+## 桌面版讀環境變數、網頁版讀網址參數 ─ 交給 MainGame.test_flag() 統一處理
 func _env(key: String, fallback: String) -> String:
-	var v := OS.get_environment(key).strip_edges()
+	var v := ""
+	if main != null and main.has_method("test_flag"):
+		v = String(main.test_flag(key)).strip_edges()
+	else:
+		v = OS.get_environment(key).strip_edges()
 	return v if v != "" else fallback
 
 
@@ -143,6 +152,8 @@ func _run() -> void:
 	match [role, scenario]:
 		["host", "happy"]:      await _host_happy()
 		["client", "happy"]:    await _client_happy()
+		["host", "link"]:       await _host_link()
+		["client", "link"]:     await _client_link()
 		["host", "badpass"]:    await _host_reject("密碼錯誤")
 		["client", "badpass"]:  await _client_rejected()
 		["host", "latejoin"]:   await _host_latejoin()
@@ -249,6 +260,89 @@ func _client_happy() -> void:
 	await wait(12.0)
 	check(main.in_match and main.world != null, "持續 12 秒後客戶端仍在戰鬥中")
 	check(main.has_net(), "12 秒後連線仍在")
+
+
+#══════════════════════════════════════════════════════════════════════════════
+#  情境四：link ─ 只驗「連得起來、名單同步、開得了賽」，不等到戰鬥階段
+#
+#  happy 情境會一路等到戰鬥（簡報 42 秒 + 部署 30 秒），在瀏覽器裡跑一次要兩分多鐘，
+#  而且整個 3D 世界都得算。要驗的是**傳輸層**通不通，所以 link 停在開賽的那一刻。
+#  網頁版的 WebRTC 驗證跑的就是這個情境。
+#══════════════════════════════════════════════════════════════════════════════
+func _host_link() -> void:
+	main._pass_edit.text = pass_word
+	main.host_game()
+
+	# WebRTC 要先連上信令伺服器才會有 peer；Render 冷啟動可能要一分鐘
+	var opened := await until(func(): return main.has_net() and main.room_code == room, timeout)
+	check(opened, "房間已開啟且房號為 %s（實際 %s）" % [room, main.room_code])
+	check(main.is_host, "本機是房主")
+
+	var joined := await until(func(): return humans(main.TEAM_ATTACKER) + humans(main.TEAM_DEFENDER) >= 2, timeout)
+	check(joined, "客戶端已連上並註冊進名單")
+	say("roster after join = " + roster_text())
+
+	var switched := await until(func(): return humans(main.TEAM_DEFENDER) >= 1, 20.0)
+	check(switched, "客戶端換陣營已同步到房主")
+
+	main.start_match()
+	check(main.in_match, "房主 in_match=true")
+	check(main.world != null, "房主已生成 GameWorld")
+	say("SETTINGS map=%d seed=%d wx=%d tod=%d diff=%d"
+		% [main.map_id, main.map_seed, main.weather, main.time_of_day, main.difficulty])
+	check(team_size(main.TEAM_ATTACKER) == main.MIN_PER_TEAM
+		and team_size(main.TEAM_DEFENDER) == main.MIN_PER_TEAM,
+		"兩隊各 %d 人（實際 %d / %d）" % [main.MIN_PER_TEAM,
+			team_size(main.TEAM_ATTACKER), team_size(main.TEAM_DEFENDER)])
+
+	await wait(10.0)
+	check(main.has_net(), "10 秒後連線仍在")
+	check(main.in_match and main.world != null, "10 秒後房主仍在對戰中")
+
+
+## 網頁版：等驅動腳本把 window.__smoke_go 設起來才加入房間。
+## 用固定秒數等房主是行不通的 ─ 兩個分頁搶同一顆 CPU 與同一條下載頻寬，
+## 光是各自抓 51 MB 再編譯 wasm，開機時間就可能差到好幾分鐘。
+func _await_go() -> void:
+	if not OS.has_feature("web") or not Engine.has_singleton("JavaScriptBridge"):
+		await wait(delay)
+		return
+	var js := Engine.get_singleton("JavaScriptBridge")
+	var ok := await until(func(): return bool(js.eval("window.__smoke_go === true", true)), timeout)
+	check(ok, "收到驅動腳本的發車信號")
+
+
+func _client_link() -> void:
+	await _await_go()
+	main.join_game(room, join_pass)
+
+	# 要用 net_connected() 而不是 has_net()：後者在 WebRTC 還在交握時就是 true，
+	# 用它判定會得到「已連上」然後下一步的 RPC 全部送不出去
+	var linked := await until(func(): return main.net_connected(), timeout)
+	check(linked, "已連上房主")
+
+	var got_roster := await until(func(): return main.players.size() >= 2, 20.0)
+	check(got_roster, "已收到房主同步的名單")
+	say("roster after join = " + roster_text())
+	check(main.my_id() != 1, "取得非 1 的 peer id（實際 %d）" % main.my_id())
+
+	main._request_team(main.TEAM_DEFENDER)
+	var mine := await until(func(): return main.my_team() == main.TEAM_DEFENDER, 20.0)
+	check(mine, "換到防守方並由房主同步確認")
+
+	var started := await until(func(): return main.in_match, 30.0)
+	check(started, "收到房主開賽")
+	check(main.world != null, "客戶端已生成 GameWorld")
+	say("SETTINGS map=%d seed=%d wx=%d tod=%d diff=%d"
+		% [main.map_id, main.map_seed, main.weather, main.time_of_day, main.difficulty])
+	check(team_size(main.TEAM_ATTACKER) == main.MIN_PER_TEAM
+		and team_size(main.TEAM_DEFENDER) == main.MIN_PER_TEAM,
+		"兩隊各 %d 人（實際 %d / %d）" % [main.MIN_PER_TEAM,
+			team_size(main.TEAM_ATTACKER), team_size(main.TEAM_DEFENDER)])
+
+	await wait(10.0)
+	check(main.has_net(), "10 秒後連線仍在")
+	check(main.in_match and main.world != null, "10 秒後客戶端仍在對戰中")
 
 
 #══════════════════════════════════════════════════════════════════════════════

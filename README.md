@@ -22,9 +22,12 @@ Godot 4.7 / GDScript ／ **100% 純程式碼建構**的非對稱空中戰鬥遊�
 | `GroundForces.gd` | 陸軍：高射砲陣地、機動防空車、補給車隊、地勤載具（移動用 `match_time` 推算，免同步） |
 | `FlightHud.gd` | 飛行視覺回饋層：滾轉刻度尺、鎖定進度環、後燃器速度線 |
 | `Main.tscn` | 引擎強制需要的進入點，**內部只有一個 Node**，不含任何 UI／3D 節點 |
-| `signaling_server.js` | WebRTC 用的極簡信令伺服器（Node.js + `ws`） |
-| `NetSmoke.gd` | 連線煙霧測試腳本，只在環境變數 `NETSMOKE` 有值時掛上，正式遊玩不執行 |
-| `tools/net_smoke.ps1` | 一行指令開兩個 headless 實例跑完整連線流程並判定通過與否 |
+| `signaling_server.js` | WebRTC 用的極簡信令伺服器（Node.js + `ws`），已部署在 Render |
+| `NetSmoke.gd` | 連線煙霧測試腳本，只在 `NETSMOKE` 開關有值時掛上，正式遊玩不執行 |
+| `tools/net_smoke.ps1` | 開兩個 headless 實例跑完整連線流程（**ENet**）並判定通過與否 |
+| `tools/web_net_smoke.js` | 開兩個瀏覽器分頁跑同一份 `NetSmoke.gd`（**WebRTC**），驗網頁版真的連得起來 |
+| `tools/webrtc_check.js` | 只驗傳輸層：用瀏覽器原生 API 重跑一次遊戲的信令協定，確認信令與 STUN 是通的 |
+| `tools/signaling_test.js` | 信令伺服器的協定測試（撞號、房間不存在、房主落跑、keepalive） |
 | `tools/check_lane.ps1` | 逐張地圖掃高度圖，確認航母進場航道沒有被地形擋住 |
 | `AutoPlay.gd` | 自動打完一局單人作戰（飛行交給內建自動駕駛），沿途記錄戰況與截圖，同樣只在 `AUTOPLAY` 有值時掛上 |
 
@@ -277,18 +280,87 @@ C:\path\to\Godot_v4.7-stable_win64_console.exe --path . --resolution 1600x900
 封包是 `unreliable_ordered`，掉幾個只會讓遠端機體插值稍微跳動，不影響裁決。
 
 ### 網頁連線（WebRTC）
-1. `npm install ws && node signaling_server.js`
-2. 修改 `MainGame.gd` 的 `SIGNALING_URL` 指向你的伺服器。
-3. 桌面編輯器要測 WebRTC 需另外安裝 **webrtc GDExtension**（`godotengine/webrtc-native`）；HTML5 匯出則由瀏覽器原生支援。
+
+**開箱即用**：<https://supercoder592.github.io/jet/> 打開就能建房／加入房間，
+信令伺服器的位址（`wss://aircombat-signaling.onrender.com`）已經是程式裡的預設值，
+不需要在網址後面加任何參數。
+
+要自己架一台來測：
+
+1. `npm install && node signaling_server.js`
+2. 用網址參數指過去：`http://127.0.0.1:8123/?signal=ws://127.0.0.1:9080`
+   （桌面版改用環境變數 `SIGNALING_URL`；兩者都會蓋掉內建預設值）
+3. 桌面編輯器要測 WebRTC 需另外安裝 **webrtc GDExtension**（`godotengine/webrtc-native`）；
+   HTML5 匯出則由瀏覽器原生支援 ─ 所以**桌面版預設走 ENet、網頁版預設走 WebRTC**。
+
+> **Render 的 free 方案閒置後會休眠**，第一個連進來的人要等它冷啟動（實測 13 秒，最壞可能超過 50 秒）。
+> 遊戲裡的信令逾時因此設到 75 秒（`SIG_CONNECT_TIMEOUT`），畫面上也會說明「伺服器需要喚醒」，
+> 不然玩家看到的會是「連不上」而不是「等一下就好」。
+
+### 連線的三支驗證腳本
+
+三支各驗一層，壞掉的時候能直接指出是哪一層：
+
+```powershell
+node tools\signaling_test.js      # 第一層：信令伺服器的協定（不開瀏覽器，2 秒跑完）
+node tools\webrtc_check.js        # 第二層：信令 + STUN + P2P 真的打得通
+node tools\web_net_smoke.js       # 第三層：整個遊戲在兩個瀏覽器分頁裡連起來
+powershell -File tools\net_smoke.ps1   # 另一條路：桌面 ENet 的遊戲邏輯與同步
+```
+
+| | 驗什麼 | 打哪裡 |
+|---|---|---|
+| `signaling_test.js` | 撞號回 `room_taken`、房間不存在回 `no_room`、`ping`→`pong`、房主離開整間關掉並釋放房號 | 預設自己起一台；`--url wss://…` 可打線上那台 |
+| `webrtc_check.js` | 用瀏覽器原生 `RTCPeerConnection` 重跑一次**跟 GDScript 完全相同的訊息格式**，確認 SDP／ICE 轉發正確、STUN 拿得到 srflx 候選、資料通道真的能來回送訊息 | 預設打線上的信令伺服器 |
+| `web_net_smoke.js` | 兩個分頁跑真正的遊戲：連上、名單同步、換陣營同步、開賽、**兩端地圖種子一致** | 預設打線上的 GitHub Pages |
+
+`webrtc_check.js` 之所以要另外用瀏覽器原生 API 重寫一次協定，是因為 **WebRTC 那條路只有網頁版跑得到** ─
+桌面版沒裝 GDExtension 根本進不去，headless 的 `NetSmoke` 也只驗得了 ENet。
+它跟 `MainGame.gd` 是兩份獨立實作，對得起來才代表協定本身沒問題。
+
+`web_net_smoke.js` 用的是 `NetSmoke.gd` 的 **`link` 情境** ─ 停在「開賽的那一刻」，
+不像 `happy` 一路等到戰鬥階段（簡報 42 秒 + 部署 30 秒）。要驗的是傳輸層，
+沒必要讓瀏覽器用軟體算圖跑完兩分半的開場。
+
+實測輸出（打正式的 Render 信令伺服器）：
+
+```
+  PASS  host 的所有斷言都通過  ─ ALL PASS（10 項）
+  PASS  client 的所有斷言都通過  ─ ALL PASS（11 項）
+  PASS  兩端的地圖／種子／天氣完全一致  ─ map=2 seed=4047340480 wx=0 tod=0 diff=1
+RESULT  ALL PASS（7 項）
+```
+
+寫這支測試時踩到的三個坑（都不是遊戲的問題，但不知道的話會誤判成遊戲壞掉）：
+
+- **隱藏的分頁不會拿到 `requestAnimationFrame`。** Godot 網頁版的主迴圈就跑在 rAF 上，
+  所以第二個分頁一開，房主那頁的遊戲會整個凍住 ─ 連信令訊息都不再處理，
+  看起來會像「房主收到 offer 卻不回 answer」。命令列的 `--disable-*-throttling`
+  只擋得住計時器節流，要靠 CDP 的 `Emulation.setFocusEmulationEnabled` 才有用。
+  **這對真人玩家也成立：房主切到別的分頁，整場都會卡住。**
+- **兩個分頁要同時開始下載。** 一前一後開的話，後開的那個得跟已經在用軟體算 3D 世界的
+  前一個搶 CPU，光是抓 51 MB 再編譯 wasm 就可能拖到逾時。
+- **客戶端不能用固定秒數等房主。** 兩邊開機時間差很大，先前用延遲的版本會撞上
+  「客戶端先到、信令回 `no_room`」。現在改成兩端都就緒後，由驅動腳本設
+  `window.__smoke_go` 發車。
+
+`NETDEBUG=1`（網頁版 `?netdebug=1`）會把整段交握逐步印出來 ─ 送出的 offer／answer、
+`set_remote_description` 的回傳碼、每 2 秒一次的 ICE 與 signaling 狀態。
+P2P 接不起來的時候兩邊各自只看得到自己那一半，沒有這個沒辦法分辨是誰沒回話。
+另外把 `SIG_VERBOSE=1` 加在信令伺服器上，可以看到每一則 SDP／ICE 的轉發方向。
 
 ## 部署成可以直接開來玩的網址
 
+**兩塊都已經上線，直接開這個網址就能玩，連線對戰也不用帶參數：**
+
+<https://supercoder592.github.io/jet/>
+
 分成**獨立的兩塊**，可以分開上線：
 
-| | 放哪裡 | 沒有它會怎樣 |
-|---|---|---|
-| 網頁本體（Godot Web 匯出） | GitHub Pages | 沒有網址可以開 |
-| 信令伺服器（`signaling_server.js`） | 任何有 TLS 的主機 | 網頁能開、**單人作戰照常玩**，只有連線對戰用不了 |
+| | 放哪裡 | 目前 | 沒有它會怎樣 |
+|---|---|---|---|
+| 網頁本體（Godot Web 匯出） | GitHub Pages | `supercoder592.github.io/jet` | 沒有網址可以開 |
+| 信令伺服器（`signaling_server.js`） | 任何有 TLS 的主機 | `aircombat-signaling.onrender.com` | 網頁能開、**單人作戰照常玩**，只有連線對戰用不了 |
 
 ### 1. 網頁本體
 
@@ -324,19 +396,37 @@ python -m http.server 8123 --directory build\web    # 本機先試開
 
 ### 3. 把兩邊接起來
 
-信令位址不再寫死。`MainGame.signaling_url()` 的優先序：
+`MainGame.signaling_url()` 的優先序：
 
-1. **網址參數 `?signal=wss://…`** — 網頁版換伺服器不必重新匯出，分享網址時就帶著走
+1. **網址參數 `?signal=wss://…`** — 換伺服器不必重新匯出，分享網址時就帶著走
 2. 環境變數 `SIGNALING_URL` — 桌面版與自動化測試用
-3. 常數 `SIGNALING_URL` — 內建預設 `ws://127.0.0.1:9080`
+3. 常數 `SIGNALING_URL` — 內建預設 **`wss://aircombat-signaling.onrender.com`**
 
-所以最後給別人的網址長這樣：
+> **內建預設一定要是正式伺服器。** 這裡原本寫的是 `ws://127.0.0.1:9080`，
+> 意思是網頁版的玩家除非自己在網址後面補 `?signal=`，否則按下 HOST 只會永遠轉圈 ─
+> 而根本不會有玩家知道要這樣做。分享出去的網址就是純網址，不能靠參數才會動。
+
+所以要換成自己的伺服器時（別人的部署）才需要：
 
 ```
 https://<帳號>.github.io/<倉庫名>/?signal=wss://<你的信令主機>
 ```
 
 網頁是 `https://` 時瀏覽器會直接擋掉 `ws://`，線上**一定**要 `wss://`。
+
+### 4. NAT 打不通的少數情況
+
+STUN（`stun.l.google.com`）應付得了絕大多數家用 NAT。少數對稱式 NAT（常見於公司網路、
+部分行動網路）兩邊都打不通，只能靠 TURN 中繼 ─ TURN 要錢又要自己架，所以不內建，
+改成用網址參數帶進來：
+
+```
+https://…/?turn=turn:你的主機:3478&turnuser=帳號&turnpass=密碼
+```
+
+桌面版對應的環境變數是 `TURN_URL` / `TURN_USER` / `TURN_PASS`。
+沒設就只用 STUN，打不通時遊戲會在 35 秒後明確告訴玩家是 P2P 建不起來（`RTC_LINK_TIMEOUT`），
+而不是無止盡地轉圈。
 
 ## 手機／平板（觸控）
 
@@ -523,7 +613,12 @@ https://<帳號>.github.io/<倉庫名>/?signal=wss://<你的信令主機>
 新版另外以 Godot 4.7 實跑並渲染截圖檢查：登入 → 主選單停機棚 → 機庫（換機種／換塗裝）→ 加入房間彈窗 →
 長官簡報 → 部署 → 登機 → 戰鬥 HUD → 座艙視角 → 峽谷 → 都市（夜間）→ 護航艦隊，全程無腳本錯誤。
 
-**尚未驗證**：WebRTC 實際連線（需信令伺服器與兩台瀏覽器）、HTML5 匯出後的 Glow 與效能表現。
+**WebRTC 實際連線已驗證**（2026-08）：兩個真實的 Chrome 分頁跑匯出後的網頁版，
+透過部署在 Render 上的信令伺服器完成 SDP／ICE 交握、建立 P2P、同步名單與陣營、開賽，
+兩端的地圖種子完全一致，雙方各 10／11 項斷言全過、零引擎錯誤。
+見上面「連線的三支驗證腳本」。
+
+**尚未驗證**：HTML5 匯出後的 Glow 與效能表現、跨網際網路（非同一台機器）的實際對戰品質。
 地形擴大後場景物件量明顯上升（峽谷牆與城市窗戶都已收進 MultiMesh，但塔樓與巨峰仍是獨立 MeshInstance3D），
 行動裝置瀏覽器可能需要再減量。
 
@@ -552,6 +647,30 @@ https://<帳號>.github.io/<倉庫名>/?signal=wss://<你的信令主機>
     （依賴 `players[id].kills`）也因此不可能觸發。現在在 `cli_kill()` 裡結算 ─
     那裡是唯一「確定有人被打下來」的地方，而且由房主 `_broadcast` 出去，各端結果一致。
 15. **自動駕駛的鎖定 HUD 被寫死成 0** — 見「專屬外掛」一節。
+16. **網頁版的線上對戰從來就不可能成功** — 預設信令位址是 `ws://127.0.0.1:9080`。
+    程式碼全都寫好了，但除非玩家自己在網址後面補 `?signal=`，按下 HOST 只會永遠轉圈。
+17. **信令的錯誤與斷線完全不會回報** — `error`（房間不存在、房號被佔用）與 WebSocket
+    關閉都只呼叫 `_set_status`，加入房間的戰術彈窗會永遠停在「交握中」。
+    現在一律走 `_net_fail()`，並且加了三道逾時：信令連線 75 秒、P2P 建立 35 秒。
+18. **收信令封包的迴圈會對 null 呼叫方法 ─ 網頁版直接 wasm crash。**
+    `while _ws.get_available_packet_count() > 0` 裡處理訊息時可能走到 `leave_net()`，
+    那裡會把 `_ws` 設成 null，下一圈就爆。桌面 debug 版只是噴一行腳本錯誤，
+    **release 的網頁版是整個 wasm 當場 `RuntimeError: null function`** ─
+    console 上完全看不出跟這裡有關。迴圈條件要每圈重新檢查 `_ws != null`。
+19. **退出房間之後再也開不了房** — 房間頁的返回鍵只是換畫面，沒有斷線：
+    信令的房間還開著、`has_net()` 仍是 true，再按 HOST 只會拿到「已在連線中，請先重新啟動」。
+    現在有一個把所有網路狀態收乾淨的 `leave_net()`。
+20. **`has_net()` 在 WebRTC 還在交握時就回 true** — 它只排除 `DISCONNECTED`，
+    而 WebRTC 一開始交握狀態就是 `CONNECTING`。造成兩個錯覺：以為連上了但 RPC
+    全部送不出去（`Trying to call an RPC via a multiplayer peer which is not connected`），
+    而且 P2P 逾時的看門狗會被這個假的 true 關掉，永遠不會告訴玩家打不通。
+    新增 `net_connected()` 判真正的 `CONNECTED`。
+21. **玩家離開時房主會噴引擎錯誤** — P2P 通常先斷、`WebRTCMultiplayerPeer` 自己就把 peer
+    移除了，信令的 `peer_left` 才姍姍來遲，再 `remove_peer()` 一次就是
+    `Condition "!peer_map.has(p_peer_id)" is true`。要先問 `has_peer()`。
+22. **`leave_net()` 第一版把狀態清理整包延到下一幀** — 為了避免在 multiplayer 輪詢自己的
+    封包時抽掉 peer。但呼叫端在斷線的同一幀就會讀 `room_code`，讀到的是還沒清掉的舊值 ─
+    `net_smoke` 的 `badpass` / `latejoin` 當場退步。現在是「狀態同步清、關 peer 延後」。
 
 ## 已知的平衡問題：進攻方拆不掉核設施
 
@@ -574,6 +693,16 @@ elif a.ai_state != "CAPTURE":
 1. **STRIKE 有黏性** — 進入 STRIKE 後設一段最短持續時間，中途不因為看到敵機就切回 ATTACK。
 2. **看陣營決定優先度** — 進攻方的 `_nearest_enemy` 半徑縮小（例如 260 m），只有真的被咬住才回頭纏鬥。
 3. **增加轟炸機配額** — `_bot_vtype()` 讓進攻方兩架 AI 都是轟炸機，或提高轟炸機對建築的倍率。
+
+## 線上對戰的已知限制
+
+- **房主切到別的瀏覽器分頁，整場會卡住。** Godot 網頁版的主迴圈跑在 `requestAnimationFrame` 上，
+  而瀏覽器不會給隱藏分頁 rAF ─ 房主一切走，世界狀態就不再廣播。
+  房主請把遊戲分頁留在前景。（客戶端切走只會影響自己。）
+- **Render free 方案會休眠**，第一個開房的人要等冷啟動（實測 13 秒，最壞可能超過 50 秒）。
+- **對稱式 NAT 打不通**：只有 STUN，沒有 TURN。遇到時遊戲會在 35 秒後明確說是 P2P 建不起來，
+  可以用 `?turn=` 帶自己的中繼伺服器（見上面「NAT 打不通的少數情況」）。
+- **房主就是伺服器**：房主離線整間房就結束。沒有主機遷移。
 
 ## 後續建議
 
