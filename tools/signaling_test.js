@@ -138,19 +138,32 @@ const code4 = () => String(1000 + Math.floor(Math.random() * 9000));
     check(m.cmd === 'pong', 'ping 有回 pong（閒置的房主靠它撐住連線）', JSON.stringify(m));
 
     // ── 8. 房主離開 → 整間關掉，客戶端被踢 ─────────────────────
+    //
+    // 本機是立刻（TCP FIN 直接到），但**線上會慢一個探活週期**：
+    // 實測 Render 的反向代理完全不轉發乾淨的 WebSocket 關閉，伺服器要靠 ping
+    // 探到沒回應才知道房主走了，關閉碼 4000 也會被代理吃掉變成 1006。
+    // 所以這裡只斷言「有被斷開」，不斷言關閉碼 ─ 斷言 4000 只在本機成立。
+    const t0 = Date.now();
     host.close();
     const closeCode = await Promise.race([
       cli.closed,
-      new Promise((r) => setTimeout(() => r('沒被關'), 8000)),
+      new Promise((r) => setTimeout(() => r(null), 70000)),
     ]);
-    check(closeCode === 4000, '房主離開後客戶端被關（code 4000）', String(closeCode));
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    check(closeCode !== null, '房主離開後客戶端被斷開', `${secs} 秒，code=${closeCode}`);
 
     // ── 9. 房間真的被釋放：同一個房號可以重開 ────────────────────
     const again = peer(); alive.push(again);
     await again.open;
-    again.send({ cmd: 'host', room });
-    m = await again.next();
-    check(m.cmd === 'welcome', '房主走後同房號可以重新開房（房間有被釋放）', JSON.stringify(m));
+    let freed = null;
+    for (let i = 0; i < 8 && !freed; i++) {
+      again.send({ cmd: 'host', room });
+      const r = await again.next();
+      if (r.cmd === 'welcome') freed = r;
+      else await new Promise((res) => setTimeout(res, 5000));
+    }
+    check(!!freed, '房主走後同房號可以重新開房（房間有被釋放）',
+      freed ? JSON.stringify(freed) : '一直是 room_taken');
   } catch (e) {
     check(false, '測試流程本身沒有爆掉', e.message);
   } finally {
