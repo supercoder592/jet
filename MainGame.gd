@@ -425,12 +425,10 @@ var _name_edit: LineEdit
 var _host_btn: Button
 var _join_btn: Button
 var _start_btn: Button
-var _mode_check: Button
 var _screens: Dictionary = {}    # Screen -> Control
 var _cur_screen: int = Screen.MENU
 var _team_btn_list: Array = []   # [{ team, btn }]  同一組選擇器會出現在多個畫面
-var _vtype_boxes: Array = []     # [HBoxContainer]
-var _weapon_boxes: Array = []    # [HBoxContainer]
+var _weapon_boxes: Array = []    # [HBoxContainer]（只剩機庫那一組）
 var _shop_credits: Label
 var _shop_upgrades: VBoxContainer
 var _shop_skins: GridContainer
@@ -636,13 +634,6 @@ func open_join_dialog() -> void:
 		_join_dlg.open(_code_edit.text if _code_edit else "")
 
 
-## 給 TacticalDialog 用的傳輸層切換
-func toggle_net_mode() -> void:
-	net_mode = NetMode.ENET if net_mode == NetMode.WEBRTC else NetMode.WEBRTC
-	_refresh_mode_btn()
-	_set_status("網路模式：%s" % ("WebRTC（網頁）" if net_mode == NetMode.WEBRTC else "ENet（本機測試）"))
-
-
 ## 主選單排版參考《貓咪大戰爭》：
 ##   頂部玩家資訊列 → 大標題橫幅 → 中央直式大按鈕堆疊 → 底部小圖示列
 func _build_lobby() -> void:
@@ -690,7 +681,7 @@ func _build_lobby() -> void:
 	_build_help_overlay()
 
 	_show_screen(Screen.MENU)
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 	_refresh_roster()
 	_refresh_difficulty()
 	_refresh_tod()
@@ -883,7 +874,7 @@ func _finish_login(r: Dictionary) -> void:
 	_login_pin.text = ""
 	_refresh_account_lbl()
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 	_refresh_shop()
 	refresh_hangar_plane()
 	_name_edit.editable = bool(account.get("guest", false))
@@ -1131,12 +1122,8 @@ func _build_screen_solo(parent: Control) -> Control:
 	col.add_child(_mk_section("選擇陣營  FACTION"))
 	col.add_child(_build_faction_selector())
 
-	col.add_child(_mk_section("選擇機種  AIRCRAFT"))
-	col.add_child(_build_vtype_selector())
-
-	col.add_child(_mk_section("副武裝  LOADOUT"))
-	col.add_child(_build_weapon_selector())
-
+	# 機種與副武裝不在這裡選：上了甲板／跑道還要按 [E] 挑一次座機、[Q] 換副武裝，
+	# 在大廳先選一遍只是讓玩家做兩次同樣的決定。要換常備機就去機庫。
 	col.add_child(_mk_section("難度  DIFFICULTY"))
 	var dh := HBoxContainer.new()
 	dh.add_theme_constant_override("separation", 8)
@@ -1193,16 +1180,8 @@ func _build_screen_room(parent: Control) -> Control:
 	left.add_child(_status_lbl)
 	left.add_child(_mk_sep())
 
-	# 用可切換的 Button 取代 CheckBox：狀態直接寫在文字上，不依賴主題勾選圖示
-	_mode_check = _mk_button("", C_DEF)
-	_mode_check.toggle_mode = true
-	_mode_check.button_pressed = (net_mode == NetMode.WEBRTC)
-	_mode_check.toggled.connect(func(on: bool):
-		net_mode = NetMode.WEBRTC if on else NetMode.ENET
-		_refresh_mode_btn()
-		_set_status("網路模式：%s" % ("WebRTC（網頁）" if on else "ENet（本機測試）")))
-	left.add_child(_mode_check)
-	_refresh_mode_btn()
+	# 傳輸層不給玩家選：桌面版沒有 webrtc GDExtension 只能走 ENet，網頁版只有
+	# WebRTC 跑得動 ─ 兩邊都只有一個能用的答案，_ready() 依平台決定就好。
 
 	# 房主可以設密碼；加入者必須輸入相同密碼才會被接受
 	left.add_child(_mk_label("房間密碼  PASSCODE（開房前設定，可留空）", 12, C_DIM))
@@ -1226,14 +1205,10 @@ func _build_screen_room(parent: Control) -> Control:
 	_join_btn.pressed.connect(open_join_dialog)
 	left.add_child(_join_btn)
 
-	# 右：陣營 / 機種 / 名單
+	# 右：陣營 / 時段 / 名單（機種與副武裝在甲板上才選，見 _build_screen_solo 的說明）
 	var right := _mk_panel_column(cols, 430)
 	right.add_child(_mk_label("陣營", 14, C_TEXT))
 	right.add_child(_build_faction_selector())
-	right.add_child(_mk_label("機種", 14, C_TEXT))
-	right.add_child(_build_vtype_selector())
-	right.add_child(_mk_label("副武裝", 14, C_TEXT))
-	right.add_child(_build_weapon_selector())
 	right.add_child(_mk_label("時段（任何人都能改）", 14, C_TEXT))
 	right.add_child(_build_tod_selector())
 	right.add_child(_mk_sep())
@@ -1471,13 +1446,6 @@ func _build_faction_selector() -> Control:
 		b.pressed.connect(func(): _request_team(team))
 		hb.add_child(b)
 		_team_btn_list.append({ "team": team, "btn": b })
-	return hb
-
-
-func _build_vtype_selector() -> Control:
-	var hb := HBoxContainer.new()
-	hb.add_theme_constant_override("separation", 8)
-	_vtype_boxes.append(hb)
 	return hb
 
 
@@ -2010,7 +1978,7 @@ func _on_became_host() -> void:
 	_set_status("房間已開啟，把房號 %s %s 給隊友。" % [room_code, pw])
 	add_chat_line("[系統] 房間 %s 建立完成%s，你是房主。" % [room_code, pw], C_DIM)
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 
 
 func _gen_room_code() -> String:
@@ -2289,7 +2257,7 @@ func leave_net() -> void:
 	if _start_btn:
 		_start_btn.disabled = true
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 
 
 func _sig_send(msg: Dictionary) -> void:
@@ -2477,7 +2445,7 @@ func _on_host_changed(my_new_id: int, host_id: int) -> void:
 		add_chat_line("[系統] 這一局結束了 ─ 世界狀態在原房主手上，沒辦法接著打。", C_DIM)
 		_show_screen(Screen.ROOM)
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 
 
 func _rtc_make_conn(peer_id: int) -> WebRTCPeerConnection:
@@ -2746,7 +2714,7 @@ func _broadcast_players() -> void:
 func cli_sync_players(data: Dictionary) -> void:
 	players = data
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 	refresh_hangar_plane()      # 停機棚裡展示的就是你現在選的機種
 
 
@@ -2830,23 +2798,6 @@ func _mk_kick_button(pid: int, pname: String) -> Button:
 	return b
 
 
-func _refresh_vtype_buttons() -> void:
-	var team := my_team()
-	var cur: int = int(players[my_id()]["vtype"]) if players.has(my_id()) else -1
-	for box in _vtype_boxes:
-		var hb: HBoxContainer = box
-		for c in hb.get_children():
-			c.queue_free()
-		for vt in TEAM_VTYPES[team]:
-			var accent: Color = VSTATS[vt]["color"]
-			var sel: bool = (int(vt) == cur)
-			var b := _mk_button(("● " if sel else "") + String(VTYPE_NAME[vt]), Color.WHITE if sel else accent)
-			b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			b.pressed.connect(func(): _request_vtype(vt))
-			hb.add_child(b)
-	_refresh_weapon_buttons()
-
-
 func _refresh_difficulty() -> void:
 	for e in _diff_btns:
 		var b: Button = e["btn"]
@@ -2866,14 +2817,6 @@ func _refresh_tod() -> void:
 		b.text = "%s%s" % ["● " if sel else "", TOD_NAME[t]["name"]]
 		b.add_theme_color_override("font_color", Color.WHITE if sel else Color(0.65, 0.80, 1.00))
 	_refresh_top_info()
-
-
-func _refresh_mode_btn() -> void:
-	if _mode_check == null:
-		return
-	var web := (net_mode == NetMode.WEBRTC)
-	_mode_check.text = "網路模式：%s" % ("☑ WebRTC（網頁）" if web else "☐ ENet（本機測試）")
-	_mode_check.add_theme_color_override("font_color", C_DEF if web else C_DIM)
 
 
 func _refresh_top_info() -> void:
@@ -2968,7 +2911,7 @@ func _return_to_menu() -> void:
 	_build_hangar()             # 回到主選單就把停機棚蓋回來
 	_show_screen(Screen.MENU)
 	_refresh_roster()
-	_refresh_vtype_buttons()
+	_refresh_weapon_buttons()
 	_refresh_account_lbl()
 
 

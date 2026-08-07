@@ -3,7 +3,7 @@ extends Control
 #  TacticalDialog.gd ─ 「加入房間」戰術彈出視窗
 #
 #  軍事 HUD 風格：四角括號、掃描線、訊號強度條、即時連線狀態機與訊息紀錄。
-#  欄位：房號／IP、連線密碼、網路模式切換。
+#  欄位：房號／IP、連線密碼。（傳輸層不給選，依平台自動決定）
 #
 #  註：刻意不宣告 class_name，由 MainGame 以 load() 動態載入。
 #══════════════════════════════════════════════════════════════════════════════
@@ -23,7 +23,6 @@ var _panel: Control
 var _state_lbl: Label
 var _detail_lbl: Label
 var _log: RichTextLabel
-var _mode_btn: Button
 var _go_btn: Button
 var _bars: Control
 var _t: float = 0.0
@@ -118,14 +117,6 @@ func build(mg: Node) -> void:
 	pass_edit.text_submitted.connect(func(_t3: String): _emit_confirm())
 	v.add_child(pass_edit)
 
-	# ── 網路模式 ──
-	_mode_btn = _button("", MainGame.C_DIM)
-	_mode_btn.pressed.connect(func():
-		if _mg != null:
-			_mg.toggle_net_mode()
-			refresh_mode())
-	v.add_child(_mode_btn)
-
 	v.add_child(_rule())
 
 	# ── 連線狀態 ──
@@ -169,7 +160,6 @@ func build(mg: Node) -> void:
 	_go_btn.pressed.connect(_emit_confirm)
 	row.add_child(_go_btn)
 
-	refresh_mode()
 	set_process(true)
 
 
@@ -184,7 +174,6 @@ func open(default_code: String = "") -> void:
 	log_line("[通道] 戰術網路模組已載入。", MainGame.C_DIM)
 	log_line("[通道] 輸入房號或主機位址後按 CONNECT。", MainGame.C_DIM)
 	set_state("idle", "待機　STANDBY", "尚未建立連線。")
-	refresh_mode()
 	code_edit.grab_focus()
 
 
@@ -212,14 +201,6 @@ func log_line(text: String, col: Color = MainGame.C_TEXT) -> void:
 	if _log == null:
 		return
 	_log.append_text("[color=#%s]%s[/color]\n" % [col.to_html(false), text])
-
-
-func refresh_mode() -> void:
-	if _mode_btn == null or _mg == null:
-		return
-	var web: bool = (int(_mg.net_mode) == int(MainGame.NetMode.WEBRTC))
-	_mode_btn.text = "傳輸層：%s　（點擊切換）" % ("WebRTC ─ 網頁對戰" if web else "ENet ─ 本機／區網測試")
-	_mode_btn.add_theme_color_override("font_color", MainGame.C_DEF if web else MainGame.C_DIM)
 
 
 func _emit_confirm() -> void:
