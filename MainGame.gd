@@ -2254,6 +2254,9 @@ func leave_net() -> void:
 	_pending_sig = {}
 	_sig_deadline_ms = 0
 	_rtc_deadline_ms = 0
+	# 這個也要清：不清的話，在「等有人接手」的期間自己按返回離開房間，
+	# 20 秒後看門狗還是會醒過來把你從（可能已經是別間房的）畫面踢回主選單
+	_migrate_deadline_ms = 0
 	_sig_next_ping_ms = 0
 	_host_code_tries = 0
 
