@@ -137,32 +137,67 @@ const code4 = () => String(1000 + Math.floor(Math.random() * 9000));
     m = await host.next();
     check(m.cmd === 'pong', 'ping 有回 pong（閒置的房主靠它撐住連線）', JSON.stringify(m));
 
-    // ── 8. 房主離開 → 整間關掉，客戶端被踢 ─────────────────────
+    // ── 7b. 房主離開 → 交棒給剩下的人（主機遷移）─────────────────
+    {
+      const mroom = code4();
+      const h = peer(); alive.push(h);
+      await h.open; h.send({ cmd: 'host', room: mroom }); await h.next();
+      const c1 = peer(); alive.push(c1);
+      await c1.open; c1.send({ cmd: 'join', room: mroom });
+      check((await c1.next()).id === 2, '遷移前：第一個客戶端拿到 id 2');
+      await h.next();  // 房主的 peer_join
+      const c2 = peer(); alive.push(c2);
+      await c2.open; c2.send({ cmd: 'join', room: mroom });
+      check((await c2.next()).id === 3, '遷移前：第二個客戶端拿到 id 3');
+      await h.next();  // 房主的 peer_join
+
+      h.close();
+      // 兩個人各自收到重新編號的通知
+      const [m1, m2] = await Promise.all([c1.next(30000), c2.next(30000)]);
+      check(m1.cmd === 'host_changed' && m1.id === 1 && m1.host === 1,
+        '原 id 最小的客戶端被指派為新房主（id 變成 1）', JSON.stringify(m1));
+      check(m2.cmd === 'host_changed' && m2.id === 2 && m2.host === 1,
+        '另一個人被重新編號成 id 2，並被告知房主是 1', JSON.stringify(m2));
+      // 新房主還要收到剩下那個人的 peer_join，才會去建連線
+      const pj = await c1.next(15000);
+      check(pj.cmd === 'peer_join' && pj.id === 2, '新房主收到剩餘玩家的 peer_join',
+        JSON.stringify(pj));
+      // 交接完之後這一間房要還在（房號沒被釋放，其他人才連得進來）
+      const late = peer(); alive.push(late);
+      await late.open; late.send({ cmd: 'join', room: mroom });
+      const lm = await late.next(15000);
+      check(lm.cmd === 'welcome', '交接後房間還在，新玩家仍然加得進來', JSON.stringify(lm));
+    }
+
+    // ── 8. 房主離開、只剩一個人 → 那個人接手，而不是被踢出去 ──────
     //
-    // 本機是立刻（TCP FIN 直接到），但**線上會慢一個探活週期**：
-    // 實測 Render 的反向代理完全不轉發乾淨的 WebSocket 關閉，伺服器要靠 ping
-    // 探到沒回應才知道房主走了，關閉碼 4000 也會被代理吃掉變成 1006。
-    // 所以這裡只斷言「有被斷開」，不斷言關閉碼 ─ 斷言 4000 只在本機成立。
+    // 這裡的秒數線上線下差很多：本機 TCP FIN 直接到，是瞬間的；
+    // 線上 Render 的反向代理完全不轉發乾淨的 WebSocket 關閉，
+    // 要等伺服器探活探到沒回應才知道房主走了（遊戲裡是由客戶端主動送
+    // host_gone 來加速，這支測試沒有模擬那一步，所以會等滿一個探活週期）。
     const t0 = Date.now();
     host.close();
-    const closeCode = await Promise.race([
-      cli.closed,
+    const handover = await Promise.race([
+      cli.next(70000).catch(() => null),
       new Promise((r) => setTimeout(() => r(null), 70000)),
     ]);
     const secs = ((Date.now() - t0) / 1000).toFixed(1);
-    check(closeCode !== null, '房主離開後客戶端被斷開', `${secs} 秒，code=${closeCode}`);
+    check(handover != null && handover.cmd === 'host_changed' && handover.id === 1,
+      '房主離開後，剩下的人被指派接手（而不是被踢）',
+      `${secs} 秒，${JSON.stringify(handover)}`);
 
-    // ── 9. 房間真的被釋放：同一個房號可以重開 ────────────────────
+    // ── 9. 最後一個人也走了 → 房號才釋放 ───────────────────────
+    cli.close();
     const again = peer(); alive.push(again);
     await again.open;
     let freed = null;
-    for (let i = 0; i < 8 && !freed; i++) {
+    for (let i = 0; i < 10 && !freed; i++) {
       again.send({ cmd: 'host', room });
       const r = await again.next();
       if (r.cmd === 'welcome') freed = r;
       else await new Promise((res) => setTimeout(res, 5000));
     }
-    check(!!freed, '房主走後同房號可以重新開房（房間有被釋放）',
+    check(!!freed, '房間裡的人都走光之後房號才釋放',
       freed ? JSON.stringify(freed) : '一直是 room_taken');
   } catch (e) {
     check(false, '測試流程本身沒有爆掉', e.message);

@@ -330,6 +330,8 @@ const C_BG   := Color(0.035, 0.045, 0.070)
 const C_PANE := Color(0.075, 0.095, 0.135, 0.94)
 const C_TEXT := Color(0.86, 0.93, 1.00)
 const C_DIM  := Color(0.52, 0.60, 0.72)
+## 房主換人這種「事情變了，但不是壞事」的系統訊息
+const C_HOST_NOTE := Color(1.00, 0.85, 0.40)
 
 # 聊天頻道
 const SCOPE_TEAM := 0
@@ -364,6 +366,9 @@ const ENET_BASE_PORT := 10000   # ENet 測試模式：埠號 = 10000 + 房號
 const SIG_CONNECT_TIMEOUT := 75.0
 ## 信令通了之後 P2P 還接不上，多半是 UDP 被擋 ─ 不能無止盡地轉圈
 const RTC_LINK_TIMEOUT := 35.0
+## 房主掉線之後，等信令伺服器指派新房主的期限。
+## 伺服器收到 host_gone 會先探房主 3 秒才交接，所以這個值不能太短。
+const MIGRATE_WAIT := 20.0
 ## 房間開著的期間信令連線要一直留著（新玩家靠它進來），
 ## 但反向代理會砍掉閒置連線，得定期戳一下
 const SIG_PING_INTERVAL := 20.0
@@ -402,6 +407,7 @@ var _conns: Dictionary = {}      # peer_id -> WebRTCPeerConnection
 var _sig_role_host: bool = false # 這次信令連線是去開房還是去加入
 var _sig_deadline_ms: int = 0    # 信令 WebSocket 要在這之前連上
 var _rtc_deadline_ms: int = 0    # P2P 要在這之前接上；0 = 不計時
+var _migrate_deadline_ms: int = 0 # 房主掉線後，等有人接手的期限；0 = 不計時
 var _sig_next_ping_ms: int = 0
 var _host_code_tries: int = 0    # 房號撞號重抽的次數
 ## NETDEBUG=1（網頁版 ?netdebug=1）會把整段交握印出來。
@@ -1228,7 +1234,7 @@ func _build_screen_room(parent: Control) -> Control:
 	right.add_child(_build_vtype_selector())
 	right.add_child(_mk_label("副武裝", 14, C_TEXT))
 	right.add_child(_build_weapon_selector())
-	right.add_child(_mk_label("時段（由房主決定）", 14, C_TEXT))
+	right.add_child(_mk_label("時段（任何人都能改）", 14, C_TEXT))
 	right.add_child(_build_tod_selector())
 	right.add_child(_mk_sep())
 	right.add_child(_mk_label("作戰序列 ROSTER", 14, C_TEXT))
@@ -1240,9 +1246,9 @@ func _build_screen_room(parent: Control) -> Control:
 		_roster[team] = vb
 	right.add_child(_mk_label("每隊不足 3 名真人時，開賽會自動補上 AI 隊友。", 11, C_DIM))
 
-	_start_btn = _mk_big_button("▶", "開始遊戲", "只有房主可以開始", Color(0.40, 1.00, 0.60))
+	_start_btn = _mk_big_button("▶", "開始遊戲", "房間裡的任何人都能開始", Color(0.40, 1.00, 0.60))
 	_start_btn.disabled = true
-	_start_btn.pressed.connect(start_match)
+	_start_btn.pressed.connect(request_start_match)
 	col.add_child(_start_btn)
 
 	# 這一頁的返回鍵不能只是換畫面：房間還開著、信令 WebSocket 還連著、
@@ -1727,12 +1733,41 @@ func _build_tod_selector() -> Control:
 		var b := _mk_button(String(info["name"]), Color(0.65, 0.80, 1.00))
 		b.custom_minimum_size = Vector2(0, 40)
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		b.pressed.connect(func():
-			time_of_day = t
-			_refresh_tod())
+		b.pressed.connect(func(): _request_tod(t))
 		hb.add_child(b)
 		_tod_btns.append({ "tod": t, "btn": b })
 	return hb
+
+
+## 時段是全房共用的設定，任何人都能改 ─ 但只有房主說了算，
+## 所以非房主是「請房主改」，改完再由房主廣播回來，四個人的畫面才會一致。
+## 這個選擇器單人設定畫面也在用，那裡沒有連線，直接改本機就好。
+func _request_tod(t: int) -> void:
+	if in_match:
+		return
+	if is_host or not has_net():
+		time_of_day = t
+		_refresh_tod()
+		if is_host and has_net():
+			rpc("cli_room_settings", time_of_day)
+	else:
+		rpc_id(1, "srv_set_tod", t)
+
+
+@rpc("any_peer", "reliable")
+func srv_set_tod(t: int) -> void:
+	if not is_host or in_match:
+		return
+	time_of_day = t
+	_refresh_tod()
+	rpc("cli_room_settings", time_of_day)
+
+
+## 房間設定的同步。開賽時 cli_start_match 也會帶一份，這裡是讓大廳裡就看得到別人改了什麼。
+@rpc("authority", "reliable")
+func cli_room_settings(tod: int) -> void:
+	time_of_day = tod
+	_refresh_tod()
 
 
 func _build_chat() -> void:
@@ -2161,10 +2196,28 @@ func _poll_signaling() -> void:
 	_check_rtc_deadline()
 
 
+## 房主掉線之後在等有人接手。等不到就只能散場 ─
+## 沒有這條的話畫面會永遠停在「等待有人接手…」。
+func _check_migrate_deadline() -> void:
+	if _migrate_deadline_ms == 0:
+		return
+	if is_host or net_connected():
+		_migrate_deadline_ms = 0
+		return
+	if Time.get_ticks_msec() < _migrate_deadline_ms:
+		return
+	_migrate_deadline_ms = 0
+	_set_status("房主已離線，而且沒有人接手房間。")
+	add_chat_line("[系統] 沒有人接手，房間結束。", C_DIM)
+	leave_net()
+	_return_to_menu()
+
+
 ## 信令通了、SDP 也換了，但 P2P 就是接不上 ─ 給它一個終點。
 ## 房主是被動等人來連，不設限；只有主動加入的一方需要這條。
 func _check_rtc_deadline() -> void:
 	_log_rtc_states()
+	_check_migrate_deadline()
 	if _rtc_deadline_ms == 0 or _sig_role_host:
 		return
 	if net_connected():
@@ -2308,6 +2361,9 @@ func _on_sig_message(m: Dictionary) -> void:
 				_set_status("與房主建立 P2P 連線中…")
 				_join_status("working", "建立 P2P　PEER LINK", "已交換信令，正在打通對點連線…")
 
+		"host_changed":
+			_on_host_changed(int(m["id"]), int(m.get("host", 1)))
+
 		"peer_join":
 			# 房主收到：等待該客戶端送 offer 過來
 			if is_host:
@@ -2324,6 +2380,8 @@ func _on_sig_message(m: Dictionary) -> void:
 				_rtc.remove_peer(pid)
 
 		"sdp":
+			if _rtc == null:
+				return   # 遷移途中，這是上一輪的殘留訊息
 			var from := int(m["from"])
 			var conn: WebRTCPeerConnection = _conns.get(from)
 			if conn == null:
@@ -2333,12 +2391,90 @@ func _on_sig_message(m: Dictionary) -> void:
 				_ndbg("set_remote_description(%s) → err=%d" % [m["type"], e])
 
 		"ice":
+			if _rtc == null:
+				return
 			var f := int(m["from"])
 			var cc: WebRTCPeerConnection = _conns.get(f)
 			if cc:
 				var e2 := cc.add_ice_candidate(String(m["mid"]), int(m["index"]), String(m["name"]))
 				if e2 != OK:
 					_ndbg("add_ice_candidate → err=%d" % e2)
+
+
+## 房主離線，信令伺服器已經重新編號並指派新房主 ─ 整組 P2P 重來一次。
+##
+## 這是**連線層**的遷移：房間、房號、名單裡的人都活下來，散掉的只有正在進行的比賽。
+## 世界狀態的裁決權（建築血量、傷害判定）與所有 AI 的擁有權都在舊房主手上，
+## 沒有跟著搬過來 ─ 硬撐下去兩邊只會越差越多，不如乾脆收掉回大廳重開一局。
+##
+## 只有 WebRTC 有這個能力。ENet 沒有信令伺服器可以居中重新牽線，
+## 客戶端之間根本不知道彼此的位址，所以那條路仍然是房主一走就結束。
+func _on_host_changed(my_new_id: int, host_id: int) -> void:
+	_migrate_deadline_ms = 0
+	var was_in_match := in_match
+	# 遷移前先把自己的陣營與機種記下來，重編號之後 players 的 key 全部作廢
+	var prev: Dictionary = players.get(my_id(), {})
+	var prev_team := int(prev.get("team", TEAM_ATTACKER))
+	var prev_vtype := int(prev.get("vtype", VType.FIGHTER))
+
+	for pid in _conns.keys():
+		var c: WebRTCPeerConnection = _conns[pid]
+		if c != null:
+			c.close()
+	_conns.clear()
+	var old := multiplayer.multiplayer_peer
+	multiplayer.multiplayer_peer = null
+	if old != null and not (old is OfflineMultiplayerPeer):
+		old.close.call_deferred()
+	_rtc = null
+
+	if was_in_match:
+		in_match = false
+		if world:
+			world.queue_free()
+			world = null
+		tutorial_mode = false
+		bots_per_team = MIN_PER_TEAM
+		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+		_lobby.visible = true
+		_build_hangar()
+
+	is_host = (my_new_id == host_id)
+	_sig_role_host = is_host
+	# 房間裡的人先前都已經驗過密碼了，遷移之後不該再驗一次 ─
+	# 新房主根本不知道舊房主設了什麼密碼，留著只會把所有人踢光
+	room_pass = ""
+	_join_pass = ""
+
+	_rtc = WebRTCMultiplayerPeer.new()
+	var err := _rtc.create_server() if is_host else _rtc.create_client(my_new_id)
+	if err != OK:
+		_net_fail("接手房主失敗（WebRTCMultiplayerPeer 錯誤碼 %d）。" % err)
+		return
+	multiplayer.multiplayer_peer = _rtc
+
+	players.clear()
+	players[my_new_id] = _new_player_entry(_local_name, prev_team, prev_vtype, false)
+
+	var note := "原房主已離線，"
+	if is_host:
+		_on_became_host()
+		add_chat_line("[系統] %s由你接手房間（房號 %s）。" % [note, room_code], C_HOST_NOTE)
+		_set_status("%s你現在是房主。房號 %s 不變，其他人會自動重連。" % [note, room_code])
+	else:
+		var c2 := _rtc_make_conn(1)
+		if c2 == null:
+			return   # _rtc_make_conn 已經走過 _net_fail
+		c2.create_offer()
+		add_chat_line("[系統] %s正在與新房主重新連線…" % note, C_HOST_NOTE)
+		_set_status("%s正在與新房主重新連線…" % note)
+		_rtc_deadline_ms = Time.get_ticks_msec() + int(RTC_LINK_TIMEOUT * 1000.0)
+
+	if was_in_match:
+		add_chat_line("[系統] 這一局結束了 ─ 世界狀態在原房主手上，沒辦法接著打。", C_DIM)
+		_show_screen(Screen.ROOM)
+	_refresh_roster()
+	_refresh_vtype_buttons()
 
 
 func _rtc_make_conn(peer_id: int) -> WebRTCPeerConnection:
@@ -2391,6 +2527,16 @@ func _on_connection_failed() -> void:
 
 
 func _on_server_disconnected() -> void:
+	# WebRTC：房主掉線不一定是散場 ─ 信令伺服器會指派新房主，等一下 host_changed 就會到。
+	# 這裡如果照舊直接 leave_net()，連信令 WebSocket 都會被關掉，遷移就再也不可能發生。
+	if net_mode == NetMode.WEBRTC and _ws != null and _ws_open:
+		_set_status("與房主斷線 ─ 等待有人接手…")
+		add_chat_line("[系統] 與房主斷線，等待接手…", C_HOST_NOTE)
+		# 主動回報。不講的話伺服器要靠探活才會發現房主走了，
+		# 而反向代理不轉發乾淨的關閉 ─ 那要等上整整兩個探活週期。
+		_sig_send({ "cmd": "host_gone" })
+		_migrate_deadline_ms = Time.get_ticks_msec() + int(MIGRATE_WAIT * 1000.0)
+		return
 	_set_status("與房主斷線。")
 	leave_net()
 	_return_to_menu()
@@ -2426,10 +2572,64 @@ func srv_register(pname: String, passcode: String = "") -> void:
 func _kick(id: int, pname: String, reason: String) -> void:
 	rpc_id(id, "cli_reject", reason)
 	add_chat_line("[系統] 拒絕 %s 的連線：%s" % [pname, reason], C_DIM)
+	_disconnect_peer_soon(id)
+
+
+## 斷掉某個 peer。一定要等一下下再斷 ─ cli_reject 還在送出的佇列裡，
+## 當場拆掉連線的話對方永遠不知道自己為什麼被踢，只會看到「與房主斷線」。
+func _disconnect_peer_soon(id: int) -> void:
+	await get_tree().create_timer(0.3).timeout
 	var peer := multiplayer.multiplayer_peer
-	if peer != null and peer is ENetMultiplayerPeer:
-		# 延後一個 frame 再踢，讓 cli_reject 有機會送出去
-		(peer as ENetMultiplayerPeer).call_deferred("disconnect_peer", id)
+	# 這 0.3 秒裡對方通常已經自己走了 ─ 收到 cli_reject 就會 leave_net()。
+	# 不先確認還在不在就踢，ENet 會噴 `!_is_active() || !peers.has(p_peer)`。
+	if peer is ENetMultiplayerPeer and multiplayer.get_peers().has(id):
+		(peer as ENetMultiplayerPeer).disconnect_peer(id)
+	elif _rtc != null and _rtc.has_peer(id):
+		_rtc.remove_peer(id)
+	if _conns.has(id):
+		var c: WebRTCPeerConnection = _conns[id]
+		if c != null:
+			c.close()
+		_conns.erase(id)
+
+
+## 房主按下名單旁的 ✕。先問一次 ─ 那個位置很小，誤點的代價是把隊友踢掉。
+func _confirm_kick(pid: int, pname: String) -> void:
+	var dlg := ConfirmationDialog.new()
+	dlg.title = "踢出房間"
+	dlg.dialog_text = "要把 %s 請出房間嗎？\n他可以再用同一個房號連回來。" % pname
+	dlg.ok_button_text = "踢出"
+	dlg.cancel_button_text = "取消"
+	dlg.confirmed.connect(func(): kick_player(pid))
+	# 用完就丟，不留在場景樹裡 ─ 名單每次同步都會重建，留著會越積越多。
+	# 用 visibility_changed 而不是 close_requested：後者只有按 ✕ 或 ESC 才會發，
+	# 按下「踢出」是直接 hide，不會經過它。
+	dlg.visibility_changed.connect(func():
+		if not dlg.visible:
+			dlg.queue_free())
+	_ui.add_child(dlg)
+	dlg.popup_centered()
+
+
+## 只有房主踢得動人。UI 那邊已經藏起按鈕了，但這裡才是真正的把關 ─
+## 藏 UI 擋不住有人自己送一個 RPC 過來。
+func kick_player(pid: int) -> void:
+	if not is_host or not has_net():
+		return
+	# 只在大廳踢。開賽後被踢的人場上還有機體、還在收世界狀態，
+	# 半途抽掉會留下一架沒有主人的飛機 ─ 那要另外處理，不在這一版。
+	if in_match:
+		_set_status("比賽進行中不能踢人。")
+		return
+	if pid == my_id() or not players.has(pid):
+		return
+	if bool(players[pid]["bot"]):
+		return
+	var pname := String(players[pid]["name"])
+	_kick(pid, pname, "你被房主請出房間了。")
+	players.erase(pid)
+	_broadcast_players()
+	add_chat_line("[系統] %s 已被踢出房間。" % pname, Color(1.0, 0.55, 0.35))
 
 
 ## 房主拒絕連線（密碼錯誤或比賽已開始）
@@ -2580,10 +2780,21 @@ func _refresh_roster() -> void:
 			if players[id]["team"] != team:
 				continue
 			var p: Dictionary = players[id]
-			var tag := "  [AI]" if p["bot"] else ("  ★" if int(id) == my_id() else "")
+			var pid := int(id)
+			var tag := "  [AI]" if p["bot"] else ("  ★" if pid == my_id() else "")
+			if pid == 1 and not p["bot"]:
+				tag += "  ♛"      # 房主
+			var row := HBoxContainer.new()
+			row.add_theme_constant_override("separation", 4)
 			var l := _mk_label("  %s%s  ─  %s" % [p["name"], tag, VTYPE_NAME[p["vtype"]]], 13,
 				C_DIM if p["bot"] else C_TEXT)
-			vb.add_child(l)
+			l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			row.add_child(l)
+			# 踢人鍵只有房主看得到，而且踢不了自己也踢不了 AI
+			#（AI 不是連線進來的，要減少 AI 請調 MIN_PER_TEAM，不是踢）
+			if is_host and has_net() and not p["bot"] and pid != my_id():
+				row.add_child(_mk_kick_button(pid, String(p["name"])))
+			vb.add_child(row)
 
 	for e in _team_btn_list:
 		var team: int = e["team"]
@@ -2592,7 +2803,28 @@ func _refresh_roster() -> void:
 		b.text = "%s%s  (%d)" % ["● " if sel else "", TEAM_NAME[team], _count_team(team, false)]
 		b.add_theme_color_override("font_color",
 			Color.WHITE if sel else (C_ATK if team == TEAM_ATTACKER else C_DEF))
+	# 開賽鍵：只要在房間裡（自己開的或連進來的）任何人都按得動
+	if _start_btn:
+		_start_btn.disabled = in_match or not (is_host or has_net())
 	_refresh_top_info()
+
+
+## 名單裡的踢人鍵。只有房主會建立它 ─ 但真正的把關在 srv_kick()，
+## UI 藏起來擋不住有人自己送 RPC。
+func _mk_kick_button(pid: int, pname: String) -> Button:
+	var b := Button.new()
+	b.text = "✕"
+	b.tooltip_text = "把 %s 請出房間" % pname
+	b.custom_minimum_size = Vector2(30, 24)
+	b.add_theme_font_size_override("font_size", 13)
+	var red := Color(1.0, 0.42, 0.38)
+	b.add_theme_color_override("font_color", red)
+	b.add_theme_color_override("font_hover_color", Color.WHITE)
+	b.add_theme_stylebox_override("normal", _mk_stylebox(Color(red.r, red.g, red.b, 0.10), red))
+	b.add_theme_stylebox_override("hover", _mk_stylebox(Color(red.r, red.g, red.b, 0.45), red))
+	b.add_theme_stylebox_override("pressed", _mk_stylebox(Color(red.r, red.g, red.b, 0.65), red))
+	b.pressed.connect(func(): _confirm_kick(pid, pname))
+	return b
 
 
 func _refresh_vtype_buttons() -> void:
@@ -2735,6 +2967,29 @@ func _return_to_menu() -> void:
 	_refresh_roster()
 	_refresh_vtype_buttons()
 	_refresh_account_lbl()
+
+
+## 開賽鍵：任何人都能按。
+## 但「開賽」這件事本身仍然只有房主做得了 ─ 地圖種子、天氣、AI 補齊都是房主算完才廣播的，
+## 兩個人同時算會得到兩個不同的世界。所以非房主是請房主代按。
+func request_start_match() -> void:
+	if in_match:
+		return
+	if is_host or not has_net():
+		start_match()
+	else:
+		rpc_id(1, "srv_request_start")
+		_set_status("已請房主開始遊戲…")
+
+
+@rpc("any_peer", "reliable")
+func srv_request_start() -> void:
+	if not is_host or in_match:
+		return
+	var id := multiplayer.get_remote_sender_id()
+	var who: String = players[id]["name"] if players.has(id) else "某人"
+	add_chat_line("[系統] %s 按下了開始遊戲。" % who, C_DIM)
+	start_match()
 
 
 func start_match() -> void:

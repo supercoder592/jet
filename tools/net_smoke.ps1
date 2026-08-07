@@ -11,7 +11,7 @@
 #  離開碼：0 = 全部通過，1 = 有情境失敗。
 # ─────────────────────────────────────────────────────────────────────────────
 param(
-	[ValidateSet('all', 'happy', 'badpass', 'latejoin')]
+	[ValidateSet('all', 'happy', 'powers', 'kick', 'badpass', 'latejoin')]
 	[string]$Scenario = 'all',
 
 	[string]$Godot = "$env:USERPROFILE\Desktop\Godot_v4.7-stable_win64_console.exe",
@@ -44,7 +44,7 @@ if (-not (Test-Path (Join-Path $ProjectDir 'NetSmoke.gd'))) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # 每個情境用不同房號，埠號 = 10000 + 房號，避免前一輪殘留的 socket 打架
-$Rooms = @{ happy = '4242'; badpass = '4343'; latejoin = '4444' }
+$Rooms = @{ happy = '4242'; badpass = '4343'; latejoin = '4444'; powers = '4545'; kick = '4646' }
 
 $OrigAppData = $env:APPDATA
 
@@ -205,8 +205,8 @@ function Invoke-Scenario {
 
 		$ok = ($hostCode -eq 0) -and ($cliCode -eq 0) -and ($hostErrs -eq 0) -and ($cliErrs -eq 0)
 
-		# happy 情境額外對拍：兩端的地圖／種子／天氣必須一模一樣，否則地形會長不一樣
-		if ($Name -eq 'happy') {
+		# 有開賽的情境要額外對拍：兩端的地圖／種子／天氣必須一模一樣，否則地形會長不一樣
+		if ($Name -eq 'happy' -or $Name -eq 'powers') {
 			$hs = Get-SettingsLine $hostLog
 			$cs = Get-SettingsLine $cliLog
 			Write-Host ""
@@ -232,7 +232,7 @@ function Invoke-Scenario {
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 $targets = @()
-if ($Scenario -eq 'all') { $targets = @('happy', 'badpass', 'latejoin') }
+if ($Scenario -eq 'all') { $targets = @('happy', 'powers', 'kick', 'badpass', 'latejoin') }
 else { $targets = @($Scenario) }
 
 Write-Host "Godot   : $Godot"

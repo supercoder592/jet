@@ -23,6 +23,8 @@ const PORT = process.env.PORT || 9080;
 // **完全不轉發乾淨的 WebSocket 關閉**，房主關掉分頁之後伺服器這端毫無感覺，
 // 房間就一直掛在那裡。所以「房主離開 → 房號釋放」的實際延遲就是這裡的一到兩倍。
 const HEARTBEAT_MS = 15000;
+// 有人回報房主失聯時，給房主多久回應探測。太短會把只是卡一下的房主換掉。
+const HOST_PROBE_MS = 3000;
 // 一間房最多幾個人（Godot 那邊 5v5，留點餘裕）
 const MAX_PEERS = 16;
 // 房間總數上限。沒有這個，隨便一支腳本就能無限開房把記憶體吃光。
@@ -51,20 +53,60 @@ function fail(ws, code, msg) {
   send(ws, { cmd: 'error', code, msg });
 }
 
+/**
+ * 房主離開 → 從剩下的人裡挑一個接手，而不是把整間房關掉。
+ *
+ * 為什麼要重新編號：Godot 的 WebRTCMultiplayerPeer 規定 server 的 unique_id 一定是 1，
+ * 所以接手的人**必須**變成 1，其餘的人也就得跟著換號。遊戲那邊收到 host_changed
+ * 之後會整組拆掉重連 ─ 舊的 P2P 對點就是那個已經走掉的人，一條都留不得。
+ *
+ * 先送給新房主再送給其他人：其他人收到就會發 offer，而 offer 要走
+ * 「客戶端 → 伺服器 → 房主」兩段，比 host_changed 到房主的一段慢，
+ * 所以房主一定來得及先把自己的 server peer 建好。
+ */
+function promoteHost(room, code) {
+  const survivors = [...room.peers.values()].sort((a, b) => a.peerId - b.peerId);
+  if (survivors.length === 0) {
+    rooms.delete(code);
+    console.log(`[room ${code}] 沒有人了，關閉`);
+    return;
+  }
+  const newHost = survivors[0];
+  room.peers.clear();
+  room.nextId = 2;
+  newHost.peerId = 1;
+  room.peers.set(1, newHost);
+  for (const s of survivors) {
+    if (s === newHost) continue;
+    s.peerId = room.nextId++;
+    room.peers.set(s.peerId, s);
+  }
+  send(newHost, { cmd: 'host_changed', id: 1, host: 1 });
+  for (const [id, ws2] of room.peers) {
+    if (id === 1) continue;
+    send(ws2, { cmd: 'host_changed', id, host: 1 });
+    send(newHost, { cmd: 'peer_join', id });
+  }
+  console.log(`[room ${code}] 房主離開，改由原 peer 接手（剩 ${room.peers.size} 人）`);
+}
+
 function leave(ws) {
   const room = rooms.get(ws.roomCode);
+  const code = ws.roomCode;
   if (!room) return;
+  const wasHost = ws.peerId === 1;
   room.peers.delete(ws.peerId);
-  for (const [, other] of room.peers) send(other, { cmd: 'peer_left', id: ws.peerId });
-  // 房主離開 → 整間關掉
-  if (ws.peerId === 1) {
-    for (const [, other] of room.peers) other.close(4000, 'host left');
-    rooms.delete(ws.roomCode);
-  } else if (room.peers.size === 0) {
-    rooms.delete(ws.roomCode);
-  }
-  console.log(`[room ${ws.roomCode}] peer ${ws.peerId} left`);
   ws.roomCode = null;
+
+  if (wasHost) {
+    promoteHost(room, code);
+  } else {
+    for (const [, other] of room.peers) send(other, { cmd: 'peer_left', id: ws.peerId });
+    if (room.peers.size === 0) {
+      rooms.delete(code);
+    }
+  }
+  console.log(`[room ${code}] peer ${ws.peerId} left${wasHost ? '（他是房主）' : ''}`);
 }
 
 wss.on('connection', (ws) => {
@@ -84,6 +126,30 @@ wss.on('connection', (ws) => {
       case 'ping':
         send(ws, { cmd: 'pong' });
         break;
+
+      // 客戶端回報「我跟房主的 P2P 斷了」。
+      // 沒有這條的話，房主關掉分頁之後要等整整兩個探活週期伺服器才會發現
+      //（反向代理不轉發乾淨的 WebSocket 關閉），交接會慢到 30 秒。
+      // 不直接相信回報的人 ─ 那等於任何人都能把房主踢下台 ─ 而是去探房主一次，
+      // 探不到才交接。
+      case 'host_gone': {
+        const code = ws.roomCode;
+        const room = rooms.get(code);
+        if (!room || ws.peerId === 1) break;
+        const host = room.peers.get(1);
+        if (!host || host.probing) break;
+        host.probing = true;
+        host.isAlive = false;
+        try { host.ping(); } catch { /* 連線已死，計時器會收掉 */ }
+        setTimeout(() => {
+          host.probing = false;
+          const still = rooms.get(code);
+          if (host.isAlive || !still || still.peers.get(1) !== host) return;
+          console.log(`[room ${code}] 有人回報房主失聯，探測無回應 → 交接`);
+          try { host.terminate(); } catch { /* 已經死了，close 事件照樣會來 */ }
+        }, HOST_PROBE_MS);
+        break;
+      }
 
       case 'host': {
         const code = String(msg.room || '');

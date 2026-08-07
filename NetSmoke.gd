@@ -34,6 +34,7 @@ var timeout: float = 25.0
 var _fails: Array[String] = []
 var _checks: int = 0
 var _saw_link: bool = false      # 曾經真的連上過（用來排除「根本沒連到」的假通過）
+var _peak_players: int = 0       # 名單人數的歷史最高，見 _client_migrate()
 
 
 func _ready() -> void:
@@ -53,8 +54,11 @@ func _ready() -> void:
 ## 一路盯著有沒有真的連上過；badpass / latejoin 要靠這個確認「有連上才被踢」，
 ## 而不是壓根沒連到主機。
 func _process(_d: float) -> void:
-	if not _saw_link and main != null and main.has_net():
+	if main == null:
+		return
+	if not _saw_link and main.has_net():
 		_saw_link = true
+	_peak_players = maxi(_peak_players, main.players.size())
 
 
 ## 桌面版讀環境變數、網頁版讀網址參數 ─ 交給 MainGame.test_flag() 統一處理
@@ -154,6 +158,12 @@ func _run() -> void:
 		["client", "happy"]:    await _client_happy()
 		["host", "link"]:       await _host_link()
 		["client", "link"]:     await _client_link()
+		["host", "powers"]:     await _host_powers()
+		["client", "powers"]:   await _client_powers()
+		["host", "kick"]:       await _host_kick()
+		["client", "kick"]:     await _client_kicked()
+		["host", "migrate"]:    await _host_migrate()
+		["client", "migrate"]:  await _client_migrate()
 		["host", "badpass"]:    await _host_reject("密碼錯誤")
 		["client", "badpass"]:  await _client_rejected()
 		["host", "latejoin"]:   await _host_latejoin()
@@ -343,6 +353,165 @@ func _client_link() -> void:
 	await wait(10.0)
 	check(main.has_net(), "10 秒後連線仍在")
 	check(main.in_match and main.world != null, "10 秒後客戶端仍在對戰中")
+
+
+#══════════════════════════════════════════════════════════════════════════════
+#  情境五：powers ─ 房主的權限開放給所有人（改時段、按開始遊戲）
+#══════════════════════════════════════════════════════════════════════════════
+func _host_powers() -> void:
+	main._pass_edit.text = pass_word
+	main.host_game()
+	check(main.has_net(), "伺服器已啟動")
+	main.time_of_day = main.TOD_DAY
+
+	var joined := await until(func(): return main.players.size() >= 2)
+	check(joined, "客戶端已註冊進名單")
+
+	# 客戶端改時段 → 房主這邊要跟著變（房主才是唯一說了算的那個）
+	var tod_synced := await until(func(): return main.time_of_day == main.TOD_NIGHT, 20.0)
+	check(tod_synced, "非房主改的時段有同步到房主（實際 %d）" % main.time_of_day)
+
+	# 客戶端按開始遊戲 → 房主要真的開賽
+	var started := await until(func(): return main.in_match, 20.0)
+	check(started, "非房主按下開始遊戲，房主真的開賽了")
+	check(main.world != null, "房主已生成 GameWorld")
+	say("SETTINGS map=%d seed=%d wx=%d tod=%d diff=%d"
+		% [main.map_id, main.map_seed, main.weather, main.time_of_day, main.difficulty])
+	check(main.time_of_day == main.TOD_NIGHT, "開賽時沿用的是客戶端選的時段")
+
+
+func _client_powers() -> void:
+	await wait(delay)
+	main.join_game(room, join_pass)
+	var linked := await until(func(): return main.net_connected())
+	check(linked, "已連上房主")
+	var got_roster := await until(func(): return main.players.size() >= 2, 10.0)
+	check(got_roster, "已收到房主同步的名單")
+
+	# 非房主改時段：本機不能自己改掉，要等房主廣播回來才算數
+	main._request_tod(main.TOD_NIGHT)
+	var echoed := await until(func(): return main.time_of_day == main.TOD_NIGHT, 20.0)
+	check(echoed, "改時段有被房主接受並廣播回來")
+
+	# 非房主按開始遊戲
+	check(not main.is_host, "本機不是房主")
+	main.request_start_match()
+	var started := await until(func(): return main.in_match, 20.0)
+	check(started, "自己按開始遊戲後真的進了比賽")
+	check(main.world != null, "客戶端已生成 GameWorld")
+	say("SETTINGS map=%d seed=%d wx=%d tod=%d diff=%d"
+		% [main.map_id, main.map_seed, main.weather, main.time_of_day, main.difficulty])
+
+
+#══════════════════════════════════════════════════════════════════════════════
+#  情境六：kick ─ 房主把人請出房間
+#══════════════════════════════════════════════════════════════════════════════
+func _host_kick() -> void:
+	main._pass_edit.text = pass_word
+	main.host_game()
+	check(main.has_net(), "伺服器已啟動")
+
+	var joined := await until(func(): return main.players.size() >= 2)
+	check(joined, "客戶端已註冊進名單")
+	say("roster before kick = " + roster_text())
+
+	# 找出那個客戶端（不是自己、不是 AI）
+	var target := 0
+	for id in main.players:
+		if int(id) != main.my_id() and not bool(main.players[id]["bot"]):
+			target = int(id)
+	check(target != 0, "找得到要踢的對象")
+
+	# 踢不動自己、踢不動 AI ─ 這兩條在 kick_player() 裡把關
+	main.kick_player(main.my_id())
+	check(main.players.has(main.my_id()), "房主踢不掉自己")
+
+	main.kick_player(target)
+	var gone := await until(func(): return not main.players.has(target), 15.0)
+	check(gone, "被踢的人已從名單移除")
+	say("roster after kick = " + roster_text())
+	check(main.has_net(), "踢完之後房主自己還活著")
+	check(main.is_host, "踢完之後房主還是房主")
+
+	# 踢完還要能正常開賽，不能留下半死的連線狀態
+	main.start_match()
+	check(main.in_match and main.world != null, "踢完之後仍然開得了賽")
+
+
+## 客戶端：連上 → 被踢 → 乾淨地退回去，而且知道理由
+func _client_kicked() -> void:
+	await wait(delay)
+	main.join_game(room, join_pass)
+
+	var linked := await until(func(): return main.net_connected(), 20.0)
+	check(linked or _saw_link, "有真的連上房主（不是連不到）")
+
+	var dropped := await until(func(): return not main.has_net(), 25.0)
+	check(dropped, "被踢之後連線已中斷")
+	check(main.room_code == "", "房號已清空（cli_reject 有跑到）")
+	check(not main.in_match, "被踢的人沒有進入戰鬥")
+	check(main.world == null, "被踢的人沒有生成 GameWorld")
+
+
+#══════════════════════════════════════════════════════════════════════════════
+#  情境七：migrate ─ 房主離線，剩下的人自動推一個出來接手
+#
+#  只有 WebRTC 跑得動（ENet 沒有信令伺服器可以居中重新牽線），所以這個情境是
+#  給 tools/web_net_smoke.js 開三個分頁用的。房主不需要做任何事 ─
+#  「離線」是由驅動腳本直接把那個分頁關掉來模擬的，那才是真實的斷線。
+#══════════════════════════════════════════════════════════════════════════════
+func _host_migrate() -> void:
+	main._pass_edit.text = pass_word
+	main.host_game()
+	var opened := await until(func(): return main.has_net() and main.room_code == room, timeout)
+	check(opened, "房間已開啟（房號 %s）" % room)
+
+	# 等兩個客戶端都連進來，驅動腳本會盯這一行才動手關分頁
+	var both := await until(func(): return main.players.size() >= 3, timeout)
+	check(both, "兩個客戶端都已連上（名單 %d 人）" % main.players.size())
+	say("MIGRATE-READY roster=" + roster_text())
+	# 之後就等著被關掉。不能自己 quit ─ 那會送出正常的離線流程，
+	# 測不到「真的斷線」這件事。
+	await wait(timeout)
+
+
+func _client_migrate() -> void:
+	await _await_go()
+	main.join_game(room, join_pass)
+
+	var linked := await until(func(): return main.net_connected(), timeout)
+	check(linked, "已連上原房主")
+	var full := await until(func(): return main.players.size() >= 3, timeout)
+	check(full, "名單裡有三個人（原房主 + 兩個客戶端）")
+	check(not main.is_host, "一開始不是房主")
+	# 不能用 := ：main 宣告成 Node，透過它呼叫的東西回傳 Variant，推導不出型別
+	var old_id: int = main.my_id()
+	say("MIGRATE-READY id=%d" % old_id)
+
+	# 這裡開始驅動腳本會把原房主的分頁關掉。
+	#
+	# 刻意**不**斷言「有察覺斷線」：交接常常比 WebRTC 自己的 ICE 逾時判定還快，
+	# 接手的那個人根本不會經過斷線狀態 ─ 那是最好的情況，不是失敗。
+	# 改成看結果：所有人都會被重新編號（接手的變 1，其餘往下排）。
+	var took := await until(func(): return main.is_host or main.my_id() != old_id, timeout)
+	check(took, "交接完成 ─ 已重新編號（%d → %d）" % [old_id, main.my_id()])
+	# 重新編號是收到 host_changed 的當下就完成的，但 P2P 還要再握一次手 ─
+	# 這裡要用等的，當場判定會抓到中間那個還沒接上的瞬間
+	var relinked := await until(func(): return main.is_host or main.net_connected(), timeout)
+	check(relinked, "交接後回到連線狀態")
+	check(main.room_code == room, "房號沒變（還是 %s，實際 %s）" % [room, main.room_code])
+	check(not main.in_match, "交接後回到大廳")
+
+	# 兩個人重新湊在同一份名單裡。
+	# 看的是**歷史最高**而不是當下 ─ 兩個分頁跑完的時間差很大，
+	# 先跑完的那個會 quit 離線，後跑完的當下再數就只剩自己了。
+	var rejoined := await until(func(): return _peak_players >= 2, 45.0)
+	check(rejoined, "名單重新湊回兩個人（最多看到 %d 人）" % _peak_players)
+	say("MIGRATED is_host=%s my_id=%d players=%d"
+		% [str(main.is_host), main.my_id(), _peak_players])
+
+	await wait(6.0)
+	check(main.is_host or main.net_connected(), "6 秒後連線仍然穩定")
 
 
 #══════════════════════════════════════════════════════════════════════════════

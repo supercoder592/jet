@@ -41,6 +41,11 @@ jobs:
         # 第一次匯入一定會以非 0 結束（沒有 .godot 快取），這裡不能讓它中斷流程
         run: godot --headless --path . --import || true
 
+      - name: 檢查每一支腳本都解析得過
+        # 匯出**不會**解析腳本，而 NetSmoke.gd / AutoPlay.gd 這類「有開關才掛上」的
+        # 檔案正常啟動也碰不到 ─ 打錯字會一路溜到瀏覽器裡才爆。擋在匯出前面。
+        run: godot --headless --path . --script res://tools/check_scripts.gd
+
       - name: 檢查字型涵蓋所有用到的字元
         # 網頁版沒有系統字型可以 fallback，缺字直接變空白方框，
         # 而且在桌面上完全看不出來 ─ 所以擋在匯出前面

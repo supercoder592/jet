@@ -38,6 +38,10 @@ const TOTAL_TIMEOUT = Number(arg('timeout', '420')) * 1000;
 // 再加上 Render 冷啟動，這個等待一定要比直覺長很多。
 const HOST_READY_TIMEOUT = Number(arg('hostready', '150')) * 1000;
 const HEADFUL = process.argv.includes('--headful');
+// link    ─ 兩個分頁，驗「連得起來、開得了賽」
+// migrate ─ 三個分頁，開到一半把房主那頁關掉，驗有人接手
+const SCENARIO = arg('scenario', 'link');
+const CLIENTS = SCENARIO === 'migrate' ? 2 : 1;
 const LOG_DIR = path.join(__dirname, '.websmoke');
 
 // NetSmoke 跑完會呼叫 get_tree().quit()，Godot 的網頁版在關閉時本來就會抱怨
@@ -61,7 +65,7 @@ const CHROME_CANDIDATES = [
 function pageUrl(role) {
   const u = new URL(BASE);
   u.searchParams.set('netsmoke', role);
-  u.searchParams.set('netsmoke_scenario', 'link');
+  u.searchParams.set('netsmoke_scenario', SCENARIO);
   u.searchParams.set('netsmoke_room', ROOM);
   u.searchParams.set('netsmoke_timeout', String(STEP_TIMEOUT));
   u.searchParams.set('netdebug', '1');   // 交握每一步都印出來，壞掉時才看得出是誰沒回話
@@ -93,8 +97,8 @@ async function waitFor(fn, ms, what) {
   throw new Error(`等 ${what} 逾時`);
 }
 
-/** 開一個分頁、導到 url，把 console 輸出全部收下來 */
-async function openTab(port, url, role, onLine) {
+/** 開一個分頁、導到 url，把 console 輸出全部收下來。label 是這支腳本用的代號 */
+async function openTab(port, url, label, onLine) {
   const target = await httpJson(`http://127.0.0.1:${port}/json/new?about:blank`, 'PUT');
   const ws = new WebSocket(target.webSocketDebuggerUrl, { maxPayload: 64 * 1024 * 1024 });
   await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
@@ -111,10 +115,10 @@ async function openTab(port, url, role, onLine) {
       const text = (msg.params.args || [])
         .map((a) => (a.value !== undefined ? String(a.value) : (a.description || '')))
         .join(' ');
-      text.split('\n').forEach((l) => { if (l.trim()) onLine(role, l.trimEnd()); });
+      text.split('\n').forEach((l) => { if (l.trim()) onLine(label, l.trimEnd()); });
     } else if (msg.method === 'Runtime.exceptionThrown') {
       const d = msg.params.exceptionDetails;
-      onLine(role, `JS EXCEPTION: ${d.text} ${d.exception ? d.exception.description || '' : ''}`);
+      onLine(label, `JS EXCEPTION: ${d.text} ${d.exception ? d.exception.description || '' : ''}`);
     }
   });
 
@@ -127,7 +131,14 @@ async function openTab(port, url, role, onLine) {
   send('Emulation.setFocusEmulationEnabled', { enabled: true });
   send('Page.setWebLifecycleState', { state: 'active' });
   send('Page.navigate', { url });
-  return { ws, role, evaluate: (expr) => send('Runtime.evaluate', { expression: expr }) };
+  return {
+    ws, label, targetId: target.id,
+    evaluate: (expr) => send('Runtime.evaluate', { expression: expr }),
+    // 直接把分頁關掉，模擬「玩家把視窗叉掉」─ 這才是真的斷線。
+    // 讓遊戲自己走正常的離線流程就測不到重點了。
+    kill: () => httpJson(`http://127.0.0.1:${port}/json/close/${target.id}`, 'GET')
+      .catch(() => null),
+  };
 }
 
 const fails = [];
@@ -178,84 +189,130 @@ function check(ok, label, detail) {
   };
   process.on('exit', cleanup);
 
-  // 兩端各自的 [SMOKE] 判定結果
-  const smoke = { host: { lines: [], result: null }, client: { lines: [], result: null } };
-  const engineErrors = { host: [], client: [] };
+  // 每個分頁一個代號。link 是 host + client；migrate 多一個客戶端，
+  // 因為房主走了之後場上至少要留兩個人才看得出「有人接手、另一個人連上他」。
+  const CLIENT_LABELS = CLIENTS === 1
+    ? ['client']
+    : Array.from({ length: CLIENTS }, (_, i) => `client${i + 1}`);
+  const LABELS = ['host', ...CLIENT_LABELS];
+
+  const smoke = {};
+  const engineErrors = {};
+  const logFiles = {};
+  const booted = {};
   let hostRoomReady = false;
-  let clientBooted = false;
 
   // 整份 console 都留下來。判定只看得到 [SMOKE] 那幾行，
   // 但真的壞掉的時候（例如 wasm crash）線索往往在它前面那幾行普通輸出裡。
   fs.mkdirSync(LOG_DIR, { recursive: true });
-  const logFiles = {
-    host: fs.createWriteStream(path.join(LOG_DIR, 'host.log')),
-    client: fs.createWriteStream(path.join(LOG_DIR, 'client.log')),
-  };
+  for (const l of LABELS) {
+    smoke[l] = { lines: [], result: null, ready: false, migrated: null };
+    engineErrors[l] = [];
+    booted[l] = false;
+    logFiles[l] = fs.createWriteStream(path.join(LOG_DIR, `${l}.log`));
+  }
 
-  const onLine = (role, line) => {
-    logFiles[role].write(line + '\n');
-    if (role === 'host' && line.includes('房間已開啟')) hostRoomReady = true;
-    if (role === 'client' && line.includes('訪客登入成功')) clientBooted = true;
+  const onLine = (label, line) => {
+    logFiles[label].write(line + '\n');
+    if (label === 'host' && line.includes('房間已開啟')) hostRoomReady = true;
+    if (line.includes('訪客登入成功')) booted[label] = true;
+    if (line.includes('MIGRATE-READY')) smoke[label].ready = true;
+    const mig = line.match(/MIGRATED is_host=(\w+) my_id=(\d+) players=(\d+)/);
+    if (mig) smoke[label].migrated = { isHost: mig[1] === 'true', id: +mig[2], players: +mig[3] };
     if (line.includes('[SMOKE]')) {
-      smoke[role].lines.push(line);
+      smoke[label].lines.push(line);
       const m = line.match(/RESULT\s+(.*)$/);
-      if (m) smoke[role].result = m[1].trim();
-      console.log(`  [${role}] ${line.replace(/^\[SMOKE\]\[[A-Z]+\]\s*/, '')}`);
+      if (m) smoke[label].result = m[1].trim();
+      console.log(`  [${label}] ${line.replace(/^\[SMOKE\]\[[A-Z]+\]\s*/, '')}`);
     } else if (IGNORED_ERRORS.some((re) => re.test(line))) {
       /* 引擎自己的收尾雜訊，不是遊戲的問題 */
     } else if (/SCRIPT ERROR|^\s*ERROR:|Node not found|JS EXCEPTION/.test(line)) {
-      engineErrors[role].push(line);
-      console.log(`  [${role}] !! ${line}`);
+      engineErrors[label].push(line);
+      console.log(`  [${label}] !! ${line}`);
     } else if (/\[NET\]|\[RTC\]/.test(line)) {
-      console.log(`  [${role}] ${line}`);
+      console.log(`  [${label}] ${line}`);
     }
   };
 
-  const tabs = [];
+  const tabs = {};
   try {
     const version = await waitFor(
       () => httpJson(`http://127.0.0.1:${port}/json/version`).catch(() => null),
       20000, 'Chrome DevTools 埠');
-    console.log(`  Chrome ${version['Browser']}\n`);
+    console.log(`  Chrome ${version['Browser']}  情境 ${SCENARIO}\n`);
 
-    // 兩個分頁同時開，讓 51 MB 的下載與 wasm 編譯平行跑 ─
+    // 所有分頁同時開，讓 51 MB 的下載與 wasm 編譯平行跑 ─
     // 一前一後開的話，後開的那個要跟已經在算 3D 世界的前一個搶 CPU，慢到會逾時。
-    tabs.push(await openTab(port, pageUrl('host'), 'host', onLine));
-    const client = await openTab(port, pageUrl('client'), 'client', onLine);
-    tabs.push(client);
+    for (const l of LABELS) {
+      tabs[l] = await openTab(port, pageUrl(l === 'host' ? 'host' : 'client'), l, onLine);
+    }
 
     // 客戶端不能靠固定秒數搶跑（先前的版本就撞上「客戶端先到，信令回 no_room」），
-    // 改成兩邊都就緒了才由這裡發車。
-    console.log('  等兩端開機、房主把房間開起來…');
-    await waitFor(async () => hostRoomReady && clientBooted, HOST_READY_TIMEOUT, '房主開好房間且客戶端已開機');
-    console.log('  兩端就緒，發車\n');
-    client.evaluate('window.__smoke_go = true');
+    // 改成全部就緒了才由這裡發車。
+    console.log('  等各端開機、房主把房間開起來…');
+    await waitFor(async () => hostRoomReady && LABELS.every((l) => booted[l]),
+      HOST_READY_TIMEOUT, '房主開好房間且所有分頁都開機');
+    console.log('  全部就緒，發車\n');
+    for (const l of CLIENT_LABELS) tabs[l].evaluate('window.__smoke_go = true');
 
-    await waitFor(async () => smoke.host.result && smoke.client.result,
-      TOTAL_TIMEOUT, '兩端都跑完（房主 / 客戶端的 RESULT）');
+    if (SCENARIO === 'migrate') {
+      // 等所有客戶端都真的進到房間了，才把房主那頁關掉 ─
+      // 太早關的話測到的是「連不上」而不是「連上之後房主跑了」
+      await waitFor(async () => CLIENT_LABELS.every((l) => smoke[l].ready),
+        TOTAL_TIMEOUT, '所有客戶端都已進房（MIGRATE-READY）');
+      console.log('  兩個客戶端都進房了，直接把房主那一頁關掉\n');
+      await tabs.host.kill();
+      delete tabs.host;
+      smoke.host.result = 'KILLED';   // 房主是被關掉的，不會有 RESULT
+    }
+
+    await waitFor(async () => LABELS.every((l) => smoke[l].result),
+      TOTAL_TIMEOUT, '所有分頁都跑完（RESULT）');
   } catch (e) {
     console.log('');
-    check(false, '兩端都在時限內跑完', e.message);
+    check(false, '所有分頁都在時限內跑完', e.message);
   } finally {
-    tabs.forEach((t) => { try { t.ws.close(); } catch { /* 已經關了 */ } });
+    Object.values(tabs).forEach((t) => { try { t.ws.close(); } catch { /* 已經關了 */ } });
     cleanup();
   }
 
   console.log('\n── 判定 ──');
-  for (const role of ['host', 'client']) {
-    const r = smoke[role].result;
-    check(!!r, `${role} 有跑完並印出 RESULT`, r || '沒有拿到 RESULT');
-    if (r) check(r.startsWith('ALL PASS'), `${role} 的所有斷言都通過`, r);
-    check(engineErrors[role].length === 0, `${role} 沒有引擎錯誤`,
-      engineErrors[role].length ? engineErrors[role].slice(0, 3).join(' / ') : '');
+  for (const label of LABELS) {
+    // migrate 情境的房主是被我們關掉的，本來就不會有 RESULT
+    if (SCENARIO === 'migrate' && label === 'host') {
+      check(smoke.host.result === 'KILLED', '房主那一頁有被關掉（模擬斷線）');
+      check(engineErrors.host.length === 0, 'host 被關掉之前沒有引擎錯誤',
+        engineErrors.host.slice(0, 3).join(' / '));
+      continue;
+    }
+    const r = smoke[label].result;
+    check(!!r, `${label} 有跑完並印出 RESULT`, r || '沒有拿到 RESULT');
+    if (r) check(r.startsWith('ALL PASS'), `${label} 的所有斷言都通過`, r);
+    check(engineErrors[label].length === 0, `${label} 沒有引擎錯誤`,
+      engineErrors[label].length ? engineErrors[label].slice(0, 3).join(' / ') : '');
   }
 
-  // 兩端抽到的地圖與種子必須完全一致，否則各打各的世界
-  const setLine = (role) => (smoke[role].lines.find((l) => l.includes('SETTINGS')) || '')
-    .replace(/^.*SETTINGS\s*/, '');
-  const hs = setLine('host'), cs = setLine('client');
-  check(hs !== '' && hs === cs, '兩端的地圖／種子／天氣完全一致',
-    hs === cs ? hs : `房主 ${hs || '(無)'} vs 客戶端 ${cs || '(無)'}`);
+  if (SCENARIO === 'migrate') {
+    // 交接的核心：剩下的人裡**剛好一個**變成房主。
+    // 零個 = 沒人接手；兩個 = 兩個人各自開了一間房，名單會從此對不起來。
+    const migs = CLIENT_LABELS.map((l) => smoke[l].migrated).filter(Boolean);
+    check(migs.length === CLIENT_LABELS.length, '每個客戶端都走完了交接',
+      `${migs.length}/${CLIENT_LABELS.length}`);
+    const hosts = migs.filter((m) => m.isHost);
+    check(hosts.length === 1, '交接後剛好一個人是房主',
+      migs.map((m, i) => `${CLIENT_LABELS[i]}:is_host=${m.isHost},id=${m.id}`).join('  '));
+    check(hosts.length === 1 && hosts[0].id === 1, '新房主的 peer id 是 1（Godot 的 server 一定是 1）',
+      hosts.length ? `實際 ${hosts[0].id}` : '沒有房主');
+    check(migs.every((m) => m.players >= 2), '交接後兩個人在同一份名單裡',
+      migs.map((m) => m.players).join(' / '));
+  } else {
+    // 兩端抽到的地圖與種子必須完全一致，否則各打各的世界
+    const setLine = (l) => (smoke[l].lines.find((x) => x.includes('SETTINGS')) || '')
+      .replace(/^.*SETTINGS\s*/, '');
+    const hs = setLine('host'), cs = setLine('client');
+    check(hs !== '' && hs === cs, '兩端的地圖／種子／天氣完全一致',
+      hs === cs ? hs : `房主 ${hs || '(無)'} vs 客戶端 ${cs || '(無)'}`);
+  }
 
   console.log('');
   if (fails.length === 0) {
